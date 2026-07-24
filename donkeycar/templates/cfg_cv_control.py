@@ -602,6 +602,145 @@ OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in 
 
 
 #
+# Object detection + obstacle avoidance (built on top of LaneFollower/
+# LaneFollower's outputs - see the design doc for the full architecture).
+#
+# OBSTACLE_AVOIDANCE_MODE gates how much of this is even added to the
+# Vehicle, and is the main safety rollout switch:
+#   "disabled" - neither ConeDetector, ObstaclePlanner, nor PilotArbiter are
+#                added at all. Pure LaneFollower, byte-for-byte today's
+#                behavior - CV_CONTROLLER_OUTPUTS (not
+#                CV_CONTROLLER_OUTPUTS_WITH_ARBITER) is used, so
+#                LaneFollower writes pilot/steering, pilot/throttle
+#                directly, exactly as before this feature existed.
+#   "observe"  - ConeDetector runs (object/* + overlay available);
+#                ObstaclePlanner does NOT run; PilotArbiter passes
+#                LaneFollower's output straight through unchanged.
+#   "shadow"   - ConeDetector + ObstaclePlanner both run, publishing
+#                avoidance/* diagnostics; PilotArbiter still only passes
+#                LaneFollower's output through - nothing it computes drives.
+#   "active"   - same as "shadow", but PilotArbiter may apply the
+#                planner's avoidance/emergency-stop output.
+# Requires CV_CONTROLLER_CLASS == "LaneFollower" for anything other than
+# "disabled" - see cv_control.py's drive(), which fails fast with a clear
+# error otherwise (ObstaclePlanner needs lane/yellow_x, lane/white_x,
+# lane/width_px, lane/lost_frames, which only LaneFollower publishes).
+OBSTACLE_AVOIDANCE_MODE = "disabled"
+
+# ConeDetector - detection backend selection.
+#   "mock"  - MockDetector: scripted/controllable fake detections, no
+#             model required. Lets the rest of the pipeline be built and
+#             tested before a cone model is trained (Milestone 6/7).
+#   "model" - not implemented yet; ConeDetector raises NotImplementedError
+#             until a real backend exists.
+CONE_DETECTOR_MODE = "mock"
+CONE_DETECTOR_MIN_CONFIDENCE = 0.5   # detections below this score are discarded
+
+# Mock backend controls (only used when CONE_DETECTOR_MODE == "mock").
+# CONE_DETECTOR_MOCK_DETECTION: a fixed detection returned every frame, or
+#   None for "nothing detected" by default - a dict of MockDetector.set_detection()
+#   kwargs, e.g. {"class_name": "traffic_cone", "confidence": 0.9, "bbox": (100,100,140,160)}
+# CONE_DETECTOR_MOCK_SCRIPT: {frame_id: entry_or_None} to script detections
+#   appearing/disappearing over time for testing - see MockDetector's docstring.
+CONE_DETECTOR_MOCK_DETECTION = None
+CONE_DETECTOR_MOCK_SCRIPT = None
+
+# Detector cadence: inference doesn't have to run every drive-loop tick.
+# OBJECT_DETECTION_HZ <= DRIVE_LOOP_HZ; the last result is cached and
+# re-published (with its original timestamp, not a refreshed one) between
+# inference ticks. OBJECT_DETECTION_MAX_LATENCY_MS is read by the (future)
+# ObstaclePlanner to reject a cached detection that's grown too old, not by
+# ConeDetector itself.
+OBJECT_DETECTION_HZ = DRIVE_LOOP_HZ
+OBJECT_DETECTION_MAX_LATENCY_MS = 500
+
+# Depth-based distance estimation (donkeycar/parts/object_detector/cone_detector.py:estimate_distance_mm).
+# Samples a bounded region within the detected bbox (not the full box,
+# which can include background beside/above the object) and uses a robust
+# percentile rather than a raw minimum, so one noisy depth pixel can't
+# trigger a false "too close" reading. Still approximate - the OAK-D's RGB
+# and stereo depth streams aren't perfectly spatially aligned (see
+# donkeycar/parts/oak_d.py).
+DEPTH_ROI_H_FRAC = (0.4, 0.6)   # horizontal slice of the bbox to sample (fraction of width)
+DEPTH_ROI_V_FRAC = (0.5, 1.0)   # vertical slice of the bbox to sample (fraction of height)
+DEPTH_ROBUST_PERCENTILE = 25    # low percentile used as the distance estimate
+DEPTH_MIN_VALID_PIXELS = 20     # below this many valid readings in the ROI, distance is invalid
+OBJECT_DETECTOR_MIN_VALID_DEPTH_MM = 200  # readings nearer than this are lens-adjacent noise, not real
+
+# Used INSTEAD OF CV_CONTROLLER_OUTPUTS whenever OBSTACLE_AVOIDANCE_MODE !=
+# "disabled" (selected in code, in cv_control.py's drive() - CV_CONTROLLER_OUTPUTS
+# itself is left untouched so "disabled" mode is guaranteed identical to
+# today's behavior regardless of what this list contains). LaneFollower's
+# steering/throttle land in the _raw keys instead of the final pilot/steering,
+# pilot/throttle ones, so PilotArbiter - added whenever the feature is enabled
+# at all - can be the single place that decides what actually reaches
+# DriveMode/the actuators. lane/lost_frames is the 7th value LaneFollower.run()
+# now returns (see lane_follower.py) - the real staleness signal ObstaclePlanner
+# needs, since lane/yellow_x and lane/white_x are sticky last-known values.
+CV_CONTROLLER_OUTPUTS_WITH_ARBITER = ['pilot/steering_raw', 'pilot/throttle_raw',
+                                      'cv/image_array', 'lane/yellow_x',
+                                      'lane/white_x', 'lane/width_px', 'lane/lost_frames']
+
+#
+# ObstaclePlanner - decision FSM (donkeycar/parts/obstacle_planner.py).
+# Only added when OBSTACLE_AVOIDANCE_MODE is "shadow" or "active".
+#
+VEHICLE_WIDTH_PX = 60             # car's own footprint, in image pixels at the scan rows used for the corridor
+CORRIDOR_SAFETY_MARGIN_PX = 20    # extra margin added to the normal driving corridor
+PEDESTRIAN_SAFETY_MARGIN_PX = 80  # wider margin used only for person detections - see design doc point 7
+PASS_CLEARANCE_MARGIN_PX = 10     # extra clearance beyond VEHICLE_WIDTH_PX required to call a side safe to pass
+WHITE_RIGHT_OF_YELLOW = True      # must match LaneFollower's own setting of the same name
+
+MAX_ACCEPTED_LANE_STALE_FRAMES = 40  # lane/lost_frames above this -> corridor treated as uncertifiable
+LANE_LOSS_EMERGENCY_TICKS = 40       # consecutive planner ticks with no corridor, while engaged with an object, -> emergency stop
+
+DETECTION_CONFIRM_FRAMES = 3      # consecutive relevant-detection ticks before FOLLOW_LANE -> OBJECT_DETECTED
+CLEAR_CONFIRM_FRAMES = 5          # consecutive not-relevant ticks before considering an object cleared
+MAX_NO_DATA_TICKS_DURING_MANEUVER = 10  # consecutive stale/missing-detector ticks during a maneuver -> emergency stop
+MANEUVER_TIMEOUT_S = 15.0         # a maneuver stuck longer than this -> emergency stop
+DEFAULT_MIN_STATE_DURATION_S = 0.3      # floor on time spent in any FSM state before another transition
+MIN_STATE_DURATION_S = {}         # optional per-state override, e.g. {FSMState.MOVE_AROUND_OBJECT: 0.5}
+
+# Tiered distance (mm) / bbox-height (px) thresholds - the px pair is only
+# used when object/distance_valid is False (see design doc point 2: missing
+# depth must never block class-based detection, bbox size is the fallback).
+DETECT_DISTANCE_MM = 3000
+DETECT_BBOX_HEIGHT_PX = 40
+SLOWDOWN_DISTANCE_MM = 1800
+SLOWDOWN_BBOX_HEIGHT_PX = 70
+AVOID_START_DISTANCE_MM = 1000
+AVOID_START_BBOX_HEIGHT_PX = 110
+EMERGENCY_STOP_DISTANCE_MM = 400
+EMERGENCY_STOP_BBOX_HEIGHT_PX = 180
+CLEARED_DISTANCE_MM = 2000
+CLEARED_BBOX_HEIGHT_PX = 60
+
+# Throttle per FSM state - reverse disabled by default; EMERGENCY_STOP is
+# always exactly 0.0 (not read from here) - see design doc point 16.
+THROTTLE_TABLE = {}  # {} uses ObstaclePlanner's own built-in defaults; override e.g. {FSMState.PASS_OBJECT: 0.1}
+
+# Per-class behavior (donkeycar/parts/obstacle_planner.py:ClassPolicy) -
+# {} uses the built-in DEFAULT_CLASS_POLICY (traffic_cone/rc_car attempt
+# avoidance; person never avoids and stops immediately; unknown classes are
+# conservative and never attempt avoidance). Override/add classes here,
+# e.g. {"rc_car": {"attempt_avoid": False}} to make rc_car stop-only.
+CLASS_POLICY = {}
+
+AVOIDANCE_STEERING_GAIN = -0.01   # proportional gain, same sign/scale convention as PID_P above - untuned guess
+AVOIDANCE_BLEND_STEP = 0.15       # how much the avoidance/lane-follower steering blend shifts per tick (~7 ticks to fully blend)
+
+#
+# PilotArbiter - final steering/throttle chokepoint (donkeycar/parts/pilot_arbiter.py).
+# Added whenever OBSTACLE_AVOIDANCE_MODE != "disabled".
+#
+ARBITER_MAX_STEERING = 1.0
+ARBITER_MAX_THROTTLE = THROTTLE_MAX
+ARBITER_MIN_THROTTLE = -1.0
+MAX_STEERING_RATE_PER_S = 4.0   # hard backstop independent of AVOIDANCE_BLEND_STEP - see design doc point 17
+MAX_THROTTLE_RATE_PER_S = 2.0   # emergency stop bypasses this - see PilotArbiter._rate_limit
+
+
+#
 # Assign path follow functions to buttons.
 # You can use game pad buttons OR web ui buttons ('web/w1' to 'web/w5')
 # Use None use the game controller default

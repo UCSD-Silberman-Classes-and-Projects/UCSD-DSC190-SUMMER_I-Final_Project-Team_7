@@ -422,7 +422,16 @@ class LaneFollower:
         if self.overlay_image and overlay_rows:
             cam_img = self.overlay_display(cam_img, overlay_rows)
 
-        return self.steering, self.throttle, cam_img, self.last_yellow_x, self.last_white_x, self.lane_width_px
+        # lost_frames is appended (not inserted) so this stays backward
+        # compatible with any CV_CONTROLLER_OUTPUTS list still configured
+        # for the original 6-tuple - see donkeycar.parts.obstacle_types and
+        # the obstacle-avoidance design doc: this is the only real signal
+        # that yellow_x/white_x are fresh detections vs. sticky last-known
+        # values from a lost streak, since Memory.put() only assigns as
+        # many positions as there are declared output names and silently
+        # ignores any extra returned values beyond that.
+        return (self.steering, self.throttle, cam_img, self.last_yellow_x, self.last_white_x,
+                self.lane_width_px, self.lost_frames)
 
     def overlay_display(self, cam_img, overlay_rows):
         '''

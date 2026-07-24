@@ -101,12 +101,100 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
     #
     # Computer Vision Controller
     #
+    # obstacle_mode gates the whole obstacle-avoidance feature (see
+    # OBSTACLE_AVOIDANCE_MODE in cfg_cv_control.py for what each value
+    # does). "disabled" leaves CV_CONTROLLER_OUTPUTS completely untouched
+    # so LaneFollower writes pilot/steering, pilot/throttle directly, exactly
+    # as it did before this feature existed - any other value redirects
+    # LaneFollower's output to the _raw keys via CV_CONTROLLER_OUTPUTS_WITH_ARBITER
+    # so PilotArbiter (added below) can own the final pilot/* keys instead.
+    #
+    obstacle_mode = getattr(cfg, 'OBSTACLE_AVOIDANCE_MODE', 'disabled')
+    if obstacle_mode == 'disabled':
+        cv_controller_outputs = cfg.CV_CONTROLLER_OUTPUTS
+    else:
+        if cfg.CV_CONTROLLER_CLASS != 'LaneFollower':
+            raise ValueError(
+                f"OBSTACLE_AVOIDANCE_MODE={obstacle_mode!r} requires CV_CONTROLLER_CLASS="
+                f"'LaneFollower' (ObstaclePlanner needs the lane/yellow_x, lane/white_x, "
+                f"lane/width_px, lane/lost_frames outputs only LaneFollower publishes) - "
+                f"got CV_CONTROLLER_CLASS={cfg.CV_CONTROLLER_CLASS!r}. Set OBSTACLE_AVOIDANCE_MODE "
+                f"back to 'disabled', or switch CV_CONTROLLER_CLASS to 'LaneFollower'.")
+        cv_controller_outputs = cfg.CV_CONTROLLER_OUTPUTS_WITH_ARBITER
+
     add_cv_controller(V, cfg, pid,
                       cfg.CV_CONTROLLER_MODULE,
                       cfg.CV_CONTROLLER_CLASS,
                       cfg.CV_CONTROLLER_INPUTS,
-                      cfg.CV_CONTROLLER_OUTPUTS,
+                      cv_controller_outputs,
                       cfg.CV_CONTROLLER_CONDITION)
+
+    #
+    # Object detection + obstacle avoidance. See cfg_cv_control.py's
+    # OBSTACLE_AVOIDANCE_MODE for exactly what each mode adds/does; this
+    # mirrors that table:
+    #   disabled - nothing below is added.
+    #   observe  - ConeDetector only (object/* + overlay); no planner, no
+    #              effect on driving (PilotArbiter passes LaneFollower's
+    #              _raw output straight through).
+    #   shadow   - ConeDetector + ObstaclePlanner run and publish
+    #              avoidance/* diagnostics, but PilotArbiter still only
+    #              passes LaneFollower's output through.
+    #   active   - same as shadow, but PilotArbiter may apply the
+    #              planner's avoidance/emergency-stop output.
+    # ConeDetector and ObstaclePlanner both run independent of user/pilot
+    # mode (no run_condition) - the detector so detections can be
+    # sanity-checked while manually driving/collecting data, the planner so
+    # it can reset its own FSM state on the pilot-mode-inactive tick rather
+    # than relying on simply not being called (see design doc).
+    #
+    if obstacle_mode != 'disabled':
+        from donkeycar.parts.object_detector.cone_detector import ConeDetector
+        V.add(ConeDetector(cfg),
+              inputs=['cam/image_array', 'cam/depth_array'],
+              outputs=['object/class', 'object/confidence', 'object/bbox',
+                       'object/center_x', 'object/distance_mm', 'object/distance_valid',
+                       'object/depth_valid_pixel_count', 'object/frame_id',
+                       'object/timestamp', 'object/raw_detections'])
+
+    if obstacle_mode in ('shadow', 'active'):
+        from donkeycar.parts.obstacle_planner import ObstaclePlanner
+        V.add(ObstaclePlanner(cfg),
+              inputs=['object/class', 'object/confidence', 'object/bbox',
+                      'object/center_x', 'object/distance_mm', 'object/distance_valid',
+                      'object/depth_valid_pixel_count', 'object/frame_id',
+                      'object/timestamp', 'object/raw_detections',
+                      'lane/yellow_x', 'lane/white_x', 'lane/width_px', 'lane/lost_frames',
+                      'run_pilot'],
+              outputs=['avoidance/steering', 'avoidance/throttle',
+                       'avoidance/command_valid', 'avoidance/emergency_stop',
+                       'avoidance/state', 'avoidance/action', 'avoidance/target_x',
+                       'avoidance/passing_side', 'avoidance/path_blocked',
+                       'avoidance/clearance_left', 'avoidance/clearance_right',
+                       'avoidance/reason'])
+
+    if obstacle_mode != 'disabled':
+        from donkeycar.parts.pilot_arbiter import PilotArbiter
+        V.add(PilotArbiter(cfg),
+              inputs=['pilot/steering_raw', 'pilot/throttle_raw',
+                      'avoidance/steering', 'avoidance/throttle',
+                      'avoidance/command_valid', 'avoidance/emergency_stop'],
+              outputs=['pilot/steering', 'pilot/throttle'])
+
+    #
+    # Debug overlay - draws corridor/bbox/target/FSM state onto cv/image_array
+    # so "shadow" mode is actually inspectable in the web UI before trusting
+    # "active" mode. Never touches pilot/steering or pilot/throttle.
+    #
+    if obstacle_mode != 'disabled' and getattr(cfg, 'OVERLAY_IMAGE', False):
+        from donkeycar.parts.obstacle_overlay import ObstacleOverlay
+        V.add(ObstacleOverlay(cfg),
+              inputs=['cv/image_array', 'object/class', 'object/confidence', 'object/bbox',
+                      'object/distance_mm', 'object/distance_valid',
+                      'lane/yellow_x', 'lane/white_x', 'lane/width_px', 'lane/lost_frames',
+                      'avoidance/state', 'avoidance/action', 'avoidance/target_x',
+                      'avoidance/passing_side', 'avoidance/path_blocked'],
+              outputs=['cv/image_array'])
 
     recording_control = ToggleRecording(cfg.AUTO_RECORD_ON_THROTTLE, cfg.RECORD_DURING_AI)
     V.add(recording_control, inputs=['user/mode', "recording"], outputs=["recording"])
