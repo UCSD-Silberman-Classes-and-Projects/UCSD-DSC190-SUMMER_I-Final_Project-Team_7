@@ -2,12 +2,15 @@
 ConeDetector - perception-only object detection for the obstacle-avoidance
 project (see the design doc referenced in donkeycar/parts/obstacle_types.py).
 
-The detector interface, a MockDetector backend so the rest of the pipeline
-can be built/tested before a trained model exists, and the depth-based
-distance helper. Wired into cv_control.py behind OBSTACLE_AVOIDANCE_MODE
-!= 'disabled'; only in "shadow"/"active" does anything (ObstaclePlanner)
-actually consume its object/* outputs - in "observe" they're diagnostic
-only (object/* + overlay), with zero effect on driving.
+The detector interface, a MockDetector backend (scripted fake detections,
+for building/testing without a camera), and an OpenCVConeDetector backend
+(donkeycar/parts/object_detector/opencv_cone_detector.py - classical
+HSV/contour orange-cone detection, no trained model needed), plus the
+depth-based distance helper shared by any backend. Wired into cv_control.py
+behind OBSTACLE_AVOIDANCE_MODE != 'disabled'; only in "shadow"/"active"
+does anything (ObstaclePlanner) actually consume its object/* outputs - in
+"observe" they're diagnostic only (object/* + overlay), with zero effect
+on driving.
 """
 
 import logging
@@ -160,11 +163,14 @@ class ConeDetector:
         self.mode = getattr(cfg, 'CONE_DETECTOR_MODE', 'mock')
         if self.mode == 'mock':
             self._backend = MockDetector(cfg)
+        elif self.mode == 'opencv':
+            from donkeycar.parts.object_detector.opencv_cone_detector import OpenCVConeDetector
+            self._backend = OpenCVConeDetector(cfg)
         elif self.mode == 'model':
             raise NotImplementedError(
                 "CONE_DETECTOR_MODE='model' has no backend yet - training/exporting "
-                "a real cone model is Milestone 6/7 of the obstacle-avoidance plan. "
-                "Use CONE_DETECTOR_MODE='mock' until then."
+                "a real cone model is a future milestone. Use CONE_DETECTOR_MODE='opencv' "
+                "(classical HSV/contour detection) or 'mock' until then."
             )
         else:
             raise ValueError(f"Unknown CONE_DETECTOR_MODE: {self.mode!r}")

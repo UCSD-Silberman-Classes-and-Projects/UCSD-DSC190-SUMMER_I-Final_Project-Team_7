@@ -628,13 +628,40 @@ OVERLAY_IMAGE = True  # True to draw computer vision overlay on camera image in 
 OBSTACLE_AVOIDANCE_MODE = "disabled"
 
 # ConeDetector - detection backend selection.
-#   "mock"  - MockDetector: scripted/controllable fake detections, no
-#             model required. Lets the rest of the pipeline be built and
-#             tested before a cone model is trained (Milestone 6/7).
-#   "model" - not implemented yet; ConeDetector raises NotImplementedError
-#             until a real backend exists.
+#   "mock"   - MockDetector: scripted/controllable fake detections, no
+#              model or camera required. Good for off-car pipeline testing.
+#   "opencv" - OpenCVConeDetector: classical HSV/contour orange-cone
+#              detection (donkeycar/parts/object_detector/opencv_cone_detector.py).
+#              No trained model needed - this is the backend to use for
+#              on-car testing until a trained model exists.
+#   "model"  - not implemented yet; ConeDetector raises NotImplementedError
+#              until a real trained-model backend exists.
 CONE_DETECTOR_MODE = "mock"
+# OpenCVConeDetector has no real probabilistic score - anything that
+# survives its filters gets a fixed confidence of 1.0, so this threshold
+# is effectively a no-op for that backend (kept for MockDetector/future
+# model backends, where a real score exists).
 CONE_DETECTOR_MIN_CONFIDENCE = 0.5   # detections below this score are discarded
+
+# OpenCVConeDetector controls (only used when CONE_DETECTOR_MODE == "opencv").
+# Classic HSV threshold -> morphological cleanup -> contour extraction ->
+# area/aspect-ratio filtering -> bounding box - the same style of pipeline
+# lane_follower.py already uses for yellow/white line detection, just for
+# orange and reporting boxes instead of a single scan-row centroid.
+#
+# These starting values are a GUESS, not a calibration - orange varies a lot
+# by cone material and lighting. Tune them the same way this project's
+# YELLOW_HSV_THRESHOLD_LOW/HIGH were tuned (see myconfig.py's history):
+# sample real HSV pixel values off the actual cone under actual track
+# lighting (hold the cone in front of the camera in "observe" mode and
+# watch the overlay/mask), don't guess blind.
+ORANGE_HSV_THRESHOLD_LOW  = (5, 120, 120)   # HSV hue 0-179; orange sits ~5-18
+ORANGE_HSV_THRESHOLD_HIGH = (18, 255, 255)
+CONE_MORPH_KERNEL_SIZE = 5          # noise-cleanup kernel size (cv2.MORPH_OPEN)
+CONE_MIN_CONTOUR_AREA_PX = 150      # smaller contours are rejected as noise/glare
+CONE_MAX_CONTOUR_AREA_PX = 60000    # implausibly large contours are rejected too
+CONE_MIN_ASPECT_RATIO = 0.8         # height/width - a cone is taller than it is wide;
+                                     # rejects flat/wide orange patches (glare, floor, clothing)
 
 # Mock backend controls (only used when CONE_DETECTOR_MODE == "mock").
 # CONE_DETECTOR_MOCK_DETECTION: a fixed detection returned every frame, or
