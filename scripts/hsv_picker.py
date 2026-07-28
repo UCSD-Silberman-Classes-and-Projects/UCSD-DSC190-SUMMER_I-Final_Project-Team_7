@@ -240,6 +240,7 @@ def main(camera_index=0, width=640, height=480, file_image=None):
     
 if __name__ == "__main__":
     import argparse
+    import sys
     
     parser = argparse.ArgumentParser()
     parser.add_argument("-c", "--camera", type=int, default=0,
