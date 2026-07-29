@@ -754,6 +754,16 @@ THROTTLE_TABLE = {}  # {} uses ObstaclePlanner's own built-in defaults; override
 CLASS_POLICY = {}
 
 AVOIDANCE_STEERING_GAIN = -0.01   # proportional gain, same sign/scale convention as PID_P above - untuned guess
+# Caps the avoidance controller's held steering command well below full
+# lock (1.0). It's open-loop (see _AvoidanceController's docstring) - once
+# computed, the SAME value is held for as long as MOVE_AROUND_OBJECT/
+# PASS_OBJECT persists, with nothing tapering it down as the car actually
+# turns. Confirmed on real track footage: an uncapped (1.0) held command
+# over-rotated the car off the actual track entirely before the object
+# was confirmed clear, triggering a real lane-loss emergency stop. 0.5 is
+# an untuned starting point - lower if the car still over-rotates,
+# raise if it can't turn sharply enough to actually clear the object.
+AVOIDANCE_MAX_STEERING = 0.5
 AVOIDANCE_BLEND_STEP = 0.15       # how much the avoidance/lane-follower steering blend shifts per tick (~7 ticks to fully blend)
 
 #

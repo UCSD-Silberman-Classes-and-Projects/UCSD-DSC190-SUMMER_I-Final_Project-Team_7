@@ -166,7 +166,19 @@ class ObstaclePlanner:
             self.class_policy[class_name] = ClassPolicy(**kwargs)
 
         avoidance_gain = getattr(cfg, 'AVOIDANCE_STEERING_GAIN', -0.01)
-        self._avoidance_controller = _AvoidanceController(avoidance_gain)
+        # The avoidance controller is open-loop (see its class docstring -
+        # no independent live measurement to feed back against), so once
+        # it computes a steering value it holds that SAME value, unchanged,
+        # for as long as the state persists - there's nothing that
+        # tapers it down as the car actually turns. Capping the magnitude
+        # here (well below full lock) keeps a held command from being an
+        # aggressive full-lock turn that can over-rotate the car off the
+        # actual track before the object is confirmed clear (confirmed on
+        # real track footage: steering pinned at 1.0 across an entire
+        # MOVE_AROUND_OBJECT run put the camera on the building/bushes,
+        # off the track, triggering a real lane-loss emergency stop).
+        avoidance_max_steering = getattr(cfg, 'AVOIDANCE_MAX_STEERING', 0.5)
+        self._avoidance_controller = _AvoidanceController(avoidance_gain, avoidance_max_steering)
         self.avoidance_blend_step = getattr(cfg, 'AVOIDANCE_BLEND_STEP', 0.15)
         self.image_center_x = getattr(cfg, 'IMAGE_W', 320) / 2.0
 
