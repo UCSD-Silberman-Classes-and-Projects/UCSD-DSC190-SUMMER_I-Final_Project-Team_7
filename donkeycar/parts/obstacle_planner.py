@@ -263,7 +263,7 @@ class ObstaclePlanner:
                                      path_blocked=True, reason=self.emergency_reason),
                     AvoidanceCommand(steering=0.0, throttle=0.0, command_valid=True, emergency_stop=True))
 
-        return self._step_fsm(det, lane, corridor, pin.now)
+        return self._step_fsm(det, lane, corridor, pin.now, pin.lane_raw_steering)
 
     # ------------------------------------------------------------------
     # emergency layer - checked every tick, ahead of normal FSM transitions
@@ -343,7 +343,7 @@ class ObstaclePlanner:
     # ------------------------------------------------------------------
     # normal (non-emergency) FSM
 
-    def _step_fsm(self, det, lane, corridor, now) -> Tuple[PlannerDecision, AvoidanceCommand]:
+    def _step_fsm(self, det, lane, corridor, now, lane_raw_steering=0.0) -> Tuple[PlannerDecision, AvoidanceCommand]:
         """
         Exactly one state transition per call, using an elif chain (not a
         cascade of independent ifs): if a transition happens, this tick
@@ -457,7 +457,19 @@ class ObstaclePlanner:
 
         elif self.state == FSMState.RETURN_TO_LANE:
             self.blend_ratio = max(0.0, self.blend_ratio - self.avoidance_blend_step)
-            steering = self._blended_steering()
+            # A genuine blend toward LaneFollower's live steering, not just
+            # a decay of the avoidance offset toward 0 (see design note on
+            # _raw_avoidance_steering). The old version held the OLD
+            # avoidance target's steering (scaled down) for the whole
+            # ramp-down, driving roughly straight regardless of where the
+            # car actually was relative to lane center, then handed off
+            # abruptly to LaneFollower's raw output in a single tick once
+            # blend_ratio hit 0 - if the car had drifted from center
+            # during the maneuver (the normal case), that produced a
+            # sudden, uncorrected jump back to centered driving instead of
+            # a smooth handoff. This interpolates toward the real live
+            # steering LaneFollower wants throughout the ramp-down instead.
+            steering = self.blend_ratio * self._raw_avoidance_steering() + (1.0 - self.blend_ratio) * lane_raw_steering
             if self.blend_ratio <= 0.0 and min_duration_elapsed:
                 self._enter_state(FSMState.FOLLOW_LANE, now)
                 self.passing_side = PassingSide.NONE
@@ -525,11 +537,13 @@ class ObstaclePlanner:
             return (c_left + det.bbox.x1) / 2.0
         return (det.bbox.x2 + c_right) / 2.0
 
-    def _blended_steering(self) -> float:
+    def _raw_avoidance_steering(self) -> float:
         if self.target_x is None:
             return 0.0
-        raw = self._avoidance_controller.steering_for(self.target_x, self.image_center_x)
-        return raw * self.blend_ratio
+        return self._avoidance_controller.steering_for(self.target_x, self.image_center_x)
+
+    def _blended_steering(self) -> float:
+        return self._raw_avoidance_steering() * self.blend_ratio
 
     def _throttle_only_command(self, state: FSMState) -> AvoidanceCommand:
         return AvoidanceCommand(steering=0.0, throttle=self.throttle_table.get(state, 0.0), command_valid=True)
@@ -541,7 +555,7 @@ class ObstaclePlanner:
             object_distance_mm, object_distance_valid, object_depth_valid_pixel_count,
             object_frame_id, object_timestamp, object_raw_detections,
             lane_yellow_x, lane_white_x, lane_width_px, lane_lost_frames,
-            run_pilot):
+            run_pilot, pilot_steering_raw=0.0):
         now = time.monotonic()
         detections = detection_batch_from_memory(
             object_class, object_confidence, object_bbox, object_distance_mm,
@@ -550,7 +564,8 @@ class ObstaclePlanner:
         lane = lane_geometry_from_memory(lane_yellow_x, lane_white_x, lane_width_px,
                                           lane_lost_frames, self.max_accepted_lane_stale_frames)
         pin = PlannerInput(detections=detections, lane=lane, mode=self.mode,
-                            pilot_mode=bool(run_pilot), now=now)
+                            pilot_mode=bool(run_pilot), now=now,
+                            lane_raw_steering=pilot_steering_raw if pilot_steering_raw is not None else 0.0)
 
         decision, command = self.step(pin)
 

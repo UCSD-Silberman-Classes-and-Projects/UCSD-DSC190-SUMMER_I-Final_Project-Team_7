@@ -235,6 +235,13 @@ class PlannerInput:
     mode: OperatingMode
     pilot_mode: bool
     now: float  # time.monotonic()
+    # LaneFollower's own current raw steering (pilot/steering_raw) - used
+    # only during RETURN_TO_LANE, to genuinely blend toward what
+    # LaneFollower currently wants rather than just decaying the
+    # avoidance offset toward 0 (see ObstaclePlanner._step_fsm's
+    # RETURN_TO_LANE branch). Defaults to 0.0 so existing callers/tests
+    # that don't care about the return-to-lane handoff are unaffected.
+    lane_raw_steering: float = 0.0
 
 
 @dataclass
