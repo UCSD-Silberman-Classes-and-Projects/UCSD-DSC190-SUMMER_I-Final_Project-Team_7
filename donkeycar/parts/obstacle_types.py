@@ -205,14 +205,26 @@ class LaneGeometry:
 
         if self.both_visible:
             center = (self.yellow_x + self.white_x) / 2.0
+            # self.width_px is a smoothed/persisted estimate that can lag
+            # behind reality (e.g. still narrow from an earlier bad
+            # reading, or from before both lines were reacquired together).
+            # When both boundaries are actually visible this frame, their
+            # live gap is direct evidence of the real lane width right now -
+            # taking whichever is WIDER avoids an artificially tight
+            # corridor from a stale/undersized smoothed estimate falsely
+            # blocking a passable route around an object. Never narrower
+            # than the smoothed estimate, so this only ever widens the
+            # corridor, never wrongly tightens it.
+            effective_width = max(self.width_px, abs(self.white_x - self.yellow_x))
         else:
             sign = 1.0 if white_right_of_yellow else -1.0
             if self.yellow_x is not None:
                 center = self.yellow_x + sign * self.width_px / 2.0
             else:
                 center = self.white_x - sign * self.width_px / 2.0
+            effective_width = self.width_px
 
-        half_span = max(vehicle_width_px, self.width_px) / 2.0 + margin_px
+        half_span = max(vehicle_width_px, effective_width) / 2.0 + margin_px
         return center - half_span, center + half_span
 
 
