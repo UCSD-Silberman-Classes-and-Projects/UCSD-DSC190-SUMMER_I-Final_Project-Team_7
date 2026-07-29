@@ -192,6 +192,7 @@ class ObstaclePlanner:
         self.no_data_count = 0
         self.lane_loss_ticks = 0
         self.blend_ratio = 0.0
+        self.frozen_corridor: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------------
     # pure core
@@ -217,11 +218,30 @@ class ObstaclePlanner:
 
         lane = pin.lane
         corridor = lane.corridor(self.vehicle_width_px, self.corridor_safety_margin_px, self.white_right_of_yellow)
+        # lane_loss_ticks tracks genuine sustained loss of the lane (car
+        # actually off the track) and must key off the LIVE corridor, not
+        # frozen_corridor below - freezing only guards against corridor
+        # confusion from a neighboring lane's lines during a swerve, it
+        # must never mask a real, total loss of lane visibility.
         self.lane_loss_ticks = self.lane_loss_ticks + 1 if corridor is None else 0
 
-        self._update_hysteresis(det, lane, batch_fresh)
+        # While actively passing an object (frozen_corridor set below, at
+        # the PLAN_AVOIDANCE -> MOVE_AROUND_OBJECT transition), use that
+        # frozen snapshot instead of the live corridor for relevance/
+        # emergency checks. Rationale (see design doc / user report): the
+        # live corridor is derived from LaneFollower's current
+        # yellow_x/white_x, but a swerve around an object can bring a
+        # *different*, nearby track's boundary line into view (tracks are
+        # laid out close together on this course) - that's not a real
+        # change in this lane's geometry, just LaneFollower momentarily
+        # confused by what it's looking at. Trusting a stable, once-
+        # computed corridor through the maneuver avoids the object-
+        # avoidance logic itself getting confused by that same noise.
+        effective_corridor = self.frozen_corridor if self.frozen_corridor is not None else corridor
 
-        emergency, reason = self._check_emergency(det, lane, corridor, pin.now)
+        self._update_hysteresis(det, lane, batch_fresh, effective_corridor)
+
+        emergency, reason = self._check_emergency(det, lane, effective_corridor, pin.now)
         if emergency:
             self.emergency_latched = True
             self.emergency_reason = reason
@@ -272,7 +292,7 @@ class ObstaclePlanner:
     # ------------------------------------------------------------------
     # hysteresis bookkeeping
 
-    def _update_hysteresis(self, det, lane, batch_fresh):
+    def _update_hysteresis(self, det, lane, batch_fresh, effective_corridor):
         if not batch_fresh:
             # no information either way - do NOT count this as clearance
             # evidence (that's the point of tracking it separately from
@@ -281,7 +301,7 @@ class ObstaclePlanner:
             return
         self.no_data_count = 0
 
-        relevant = self._is_relevant(det, lane)
+        relevant = self._is_relevant(det, lane, effective_corridor)
         if relevant:
             self.detect_confirm_count += 1
             self.clear_confirm_count = 0
@@ -289,12 +309,19 @@ class ObstaclePlanner:
             self.clear_confirm_count += 1
             self.detect_confirm_count = 0
 
-    def _is_relevant(self, det, lane) -> bool:
+    def _is_relevant(self, det, lane, effective_corridor) -> bool:
         if det is None:
             return False
         policy = self._policy_for(det.class_name)
-        margin = self.pedestrian_safety_margin_px if policy.use_pedestrian_corridor else self.corridor_safety_margin_px
-        corridor = lane.corridor(self.vehicle_width_px, margin, self.white_right_of_yellow)
+        if policy.use_pedestrian_corridor:
+            # person policy never reaches a state where frozen_corridor is
+            # set (attempt_avoid=False keeps it out of PLAN_AVOIDANCE, and
+            # stop_immediately intercepts earlier in _check_emergency) - it
+            # always needs its own, differently-margined corridor, live.
+            corridor = lane.corridor(self.vehicle_width_px, self.pedestrian_safety_margin_px,
+                                      self.white_right_of_yellow)
+        else:
+            corridor = effective_corridor
         if corridor is None:
             # can't certify a corridor - conservative: don't silently
             # ignore the detection (design doc point 10)
@@ -374,6 +401,11 @@ class ObstaclePlanner:
             side = self._pick_side(clearance_left, clearance_right)
             self.passing_side = side
             self.target_x = self._target_x(det, corridor, side)
+            # Freeze this corridor for the rest of the maneuver - see the
+            # freezing rationale in step(). Captured from the same live
+            # corridor target_x was just computed from, so both stay
+            # mutually consistent for the duration of the pass.
+            self.frozen_corridor = corridor
             self.maneuver_started_at = now
             self._enter_state(FSMState.MOVE_AROUND_OBJECT, now)
             return (PlannerDecision(state=FSMState.MOVE_AROUND_OBJECT, action=Action.AVOID,
@@ -399,6 +431,12 @@ class ObstaclePlanner:
             steering = self._blended_steering()
             if confirmed_clear and min_duration_elapsed:
                 self._enter_state(FSMState.RETURN_TO_LANE, now)
+                # Live lane geometry is trusted again from here on - the
+                # object has been passed, so there's no more risk of the
+                # avoidance logic itself getting confused by a neighboring
+                # lane's lines, and LaneFollower needs accurate live
+                # readings to actually re-center the car.
+                self.frozen_corridor = None
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="passing object, confirming clearance"),
@@ -413,6 +451,7 @@ class ObstaclePlanner:
                 self.passing_side = PassingSide.NONE
                 self.target_x = None
                 self.maneuver_started_at = None
+                self.frozen_corridor = None
                 return (PlannerDecision(state=FSMState.FOLLOW_LANE, action=Action.FOLLOW,
                                          reason="returned to lane"),
                         AvoidanceCommand(command_valid=False))
