@@ -209,6 +209,14 @@ class ObstaclePlanner:
         # car physically left (or vice versa) - avoids needing a code
         # change to correct a real-hardware sign mismatch.
         self.avoid_steer_polarity = getattr(cfg, 'AVOID_STEER_POLARITY', 1.0)
+        # Floor under LaneFollower's live throttle during the maneuver
+        # states - confirmed on real track testing: LaneFollower's own
+        # throttle can decay toward/to 0 from sustained lane loss (its own
+        # LOST_STEERING_DECAY logic) right as the swerve engages, meaning
+        # the car turns its wheels but doesn't actually move at all.
+        # Never lets the maneuver throttle drop below this, even if
+        # LaneFollower's live value is lower.
+        self.min_maneuver_throttle = getattr(cfg, 'MIN_MANEUVER_THROTTLE', 0.15)
 
         # Each emergency check individually toggleable via myconfig.py -
         # all default True (unchanged behavior). PERSON and LANE_LOSS
@@ -495,7 +503,7 @@ class ObstaclePlanner:
                                      clearance_left=clearance_left, clearance_right=clearance_right,
                                      reason="avoidance planned, moving around object"),
                     AvoidanceCommand(steering=self._scripted_steering(side),
-                                      throttle=lane_raw_throttle,
+                                      throttle=self._maneuver_throttle(lane_raw_throttle),
                                       command_valid=True))
 
         # MOVE_AROUND_OBJECT / PASS_OBJECT / STEER_BACK: a scripted, timed
@@ -513,7 +521,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=True,
                                      reason="steering toward chosen side"),
-                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
+                    AvoidanceCommand(steering=steering, throttle=self._maneuver_throttle(lane_raw_throttle),
                                       command_valid=True))
 
         elif self.state == FSMState.PASS_OBJECT:
@@ -525,7 +533,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="passing object in blind spot, holding straight"),
-                    AvoidanceCommand(steering=0.0, throttle=lane_raw_throttle,
+                    AvoidanceCommand(steering=0.0, throttle=self._maneuver_throttle(lane_raw_throttle),
                                       command_valid=True))
 
         elif self.state == FSMState.STEER_BACK:
@@ -544,7 +552,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="steering back across to original lane"),
-                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
+                    AvoidanceCommand(steering=steering, throttle=self._maneuver_throttle(lane_raw_throttle),
                                       command_valid=True))
 
         elif self.state == FSMState.RETURN_TO_LANE:
@@ -566,7 +574,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="easing back to lane center"),
-                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
+                    AvoidanceCommand(steering=steering, throttle=self._maneuver_throttle(lane_raw_throttle),
                                       command_valid=True))
 
         # Unreachable in practice, but keeps a defined fallback if a new
@@ -638,6 +646,17 @@ class ObstaclePlanner:
         if reverse:
             sign = -sign
         return self.avoid_steer_polarity * self.avoid_steer_magnitude * sign
+
+    def _maneuver_throttle(self, lane_raw_throttle: float) -> float:
+        """
+        LaneFollower's own throttle, floored at min_maneuver_throttle -
+        confirmed on real track testing that LaneFollower's throttle can
+        decay toward/to 0 from sustained lane loss right as the swerve
+        engages, which otherwise turns the wheels without actually moving
+        the car. Never raises it above what LaneFollower was already
+        doing, only guarantees a minimum.
+        """
+        return max(lane_raw_throttle, self.min_maneuver_throttle)
 
     # ------------------------------------------------------------------
     # Vehicle part entry point
