@@ -521,6 +521,14 @@ class ObstaclePlanner:
 
     def _enter_state(self, new_state: FSMState, now: float):
         if new_state != self.state:
+            # Logged (not printed) so it shows up in the same terminal
+            # already running manage.py (logging.basicConfig(level=INFO)
+            # there) - copy/paste the terminal output after a run to see
+            # the exact sequence of transitions, with timing and side,
+            # without needing screenshots.
+            logger.info(
+                f"ObstaclePlanner: {self.state.value} -> {new_state.value} "
+                f"(side={self.passing_side.value}, t={now:.2f}s)")
             self.state = new_state
             self.state_entered_at = now
 
