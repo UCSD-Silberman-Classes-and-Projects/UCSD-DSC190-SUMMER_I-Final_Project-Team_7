@@ -41,14 +41,17 @@ logger = logging.getLogger(__name__)
 # being avoided would just be a redundant, premature stop.
 ENGAGED_STATES = frozenset([
     FSMState.OBJECT_DETECTED, FSMState.PLAN_AVOIDANCE, FSMState.MOVE_AROUND_OBJECT,
-    FSMState.PASS_OBJECT, FSMState.RETURN_TO_LANE,
+    FSMState.PASS_OBJECT, FSMState.STEER_BACK, FSMState.RETURN_TO_LANE,
 ])
 
-# States where a passing side has been committed to and a corridor must
-# stay provable for the maneuver to continue safely.
+# States that are part of a committed maneuver and must respect its
+# overall timeout, regardless of whether they still depend on live
+# corridor geometry (see _check_emergency - only PLAN_AVOIDANCE still
+# checks corridor validity/side safety directly; the scripted timed
+# phases below deliberately don't, see their class docstring note).
 MANEUVER_STATES = frozenset([
     FSMState.PLAN_AVOIDANCE, FSMState.MOVE_AROUND_OBJECT, FSMState.PASS_OBJECT,
-    FSMState.RETURN_TO_LANE,
+    FSMState.STEER_BACK, FSMState.RETURN_TO_LANE,
 ])
 
 
@@ -155,6 +158,7 @@ class ObstaclePlanner:
             FSMState.PLAN_AVOIDANCE: 0.12,
             FSMState.MOVE_AROUND_OBJECT: 0.12,
             FSMState.PASS_OBJECT: 0.12,
+            FSMState.STEER_BACK: 0.12,
             FSMState.RETURN_TO_LANE: 0.18,
         }
         configured = getattr(cfg, 'THROTTLE_TABLE', {}) or {}
@@ -182,6 +186,26 @@ class ObstaclePlanner:
         self.avoidance_blend_step = getattr(cfg, 'AVOIDANCE_BLEND_STEP', 0.15)
         self.image_center_x = getattr(cfg, 'IMAGE_W', 320) / 2.0
 
+        # Scripted, timed pass maneuver (MOVE_AROUND_OBJECT / PASS_OBJECT /
+        # STEER_BACK below) - replaces continuously recomputing a live
+        # corridor/target during the pass. The car deliberately crosses
+        # into the opposite lane to get around an object that blocks most
+        # of its own lane's width (this is a two-way street, but the
+        # object leaves no other option) - once alongside/past the object
+        # it's in a genuine blind spot (confirmed by direct observation on
+        # the real course), so "wait until the object is confirmed clear"
+        # cannot work for this middle phase; these three phases are timed
+        # instead. All three are untuned starting points - tune against
+        # real runs at your actual throttle.
+        self.avoid_steer_duration_s = getattr(cfg, 'AVOID_STEER_DURATION_S', 1.0)
+        self.avoid_straight_duration_s = getattr(cfg, 'AVOID_STRAIGHT_DURATION_S', 1.5)
+        self.avoid_return_duration_s = getattr(cfg, 'AVOID_RETURN_DURATION_S', 1.0)
+        self.avoid_steer_magnitude = getattr(cfg, 'AVOID_STEER_MAGNITUDE', 0.5)
+        # Flip to -1.0 on the car if PassingSide.RIGHT ends up steering the
+        # car physically left (or vice versa) - avoids needing a code
+        # change to correct a real-hardware sign mismatch.
+        self.avoid_steer_polarity = getattr(cfg, 'AVOID_STEER_POLARITY', 1.0)
+
         # Read once at construction, not per tick - OBSTACLE_AVOIDANCE_MODE
         # doesn't change during a drive() session, and step()'s own FSM
         # logic doesn't branch on it anyway (see design doc: mode-based
@@ -204,7 +228,6 @@ class ObstaclePlanner:
         self.no_data_count = 0
         self.lane_loss_ticks = 0
         self.blend_ratio = 0.0
-        self.frozen_corridor: Optional[Tuple[float, float]] = None
 
     # ------------------------------------------------------------------
     # pure core
@@ -230,30 +253,23 @@ class ObstaclePlanner:
 
         lane = pin.lane
         corridor = lane.corridor(self.vehicle_width_px, self.corridor_safety_margin_px, self.white_right_of_yellow)
-        # lane_loss_ticks tracks genuine sustained loss of the lane (car
-        # actually off the track) and must key off the LIVE corridor, not
-        # frozen_corridor below - freezing only guards against corridor
-        # confusion from a neighboring lane's lines during a swerve, it
-        # must never mask a real, total loss of lane visibility.
-        self.lane_loss_ticks = self.lane_loss_ticks + 1 if corridor is None else 0
+        # Only meaningful before the car has committed to crossing lanes -
+        # once MOVE_AROUND_OBJECT/PASS_OBJECT/STEER_BACK begin, the car is
+        # deliberately off in the opposite lane by design (see those
+        # states' docstring note), so its own lane's corridor stops being
+        # a meaningful safety signal for what's happening right now. Scope
+        # this to ENGAGED_STATES minus the scripted phases, so a real,
+        # total loss of lane visibility is still caught before/after the
+        # scripted pass, without misfiring on the expected "looks like a
+        # different lane" view during the scripted phases themselves.
+        if self.state in (FSMState.OBJECT_DETECTED, FSMState.PLAN_AVOIDANCE, FSMState.RETURN_TO_LANE):
+            self.lane_loss_ticks = self.lane_loss_ticks + 1 if corridor is None else 0
+        else:
+            self.lane_loss_ticks = 0
 
-        # While actively passing an object (frozen_corridor set below, at
-        # the PLAN_AVOIDANCE -> MOVE_AROUND_OBJECT transition), use that
-        # frozen snapshot instead of the live corridor for relevance/
-        # emergency checks. Rationale (see design doc / user report): the
-        # live corridor is derived from LaneFollower's current
-        # yellow_x/white_x, but a swerve around an object can bring a
-        # *different*, nearby track's boundary line into view (tracks are
-        # laid out close together on this course) - that's not a real
-        # change in this lane's geometry, just LaneFollower momentarily
-        # confused by what it's looking at. Trusting a stable, once-
-        # computed corridor through the maneuver avoids the object-
-        # avoidance logic itself getting confused by that same noise.
-        effective_corridor = self.frozen_corridor if self.frozen_corridor is not None else corridor
+        self._update_hysteresis(det, lane, batch_fresh, corridor)
 
-        self._update_hysteresis(det, lane, batch_fresh, effective_corridor)
-
-        emergency, reason = self._check_emergency(det, lane, effective_corridor, pin.now)
+        emergency, reason = self._check_emergency(det, lane, corridor, pin.now)
         if emergency:
             self.emergency_latched = True
             self.emergency_reason = reason
@@ -289,13 +305,19 @@ class ObstaclePlanner:
             if self.no_data_count > self.max_no_data_ticks_during_maneuver:
                 return True, "detector data invalid/missing during an active maneuver"
 
-        if self.state in MANEUVER_STATES:
+        # Corridor/side-safety only checked in PLAN_AVOIDANCE - that's the
+        # only remaining state that depends on live corridor geometry for
+        # a decision (see MOVE_AROUND_OBJECT/PASS_OBJECT/STEER_BACK's
+        # scripted-timing docstring note for why they deliberately don't).
+        if self.state == FSMState.PLAN_AVOIDANCE:
             if corridor is None:
                 return True, "no safe passing corridor exists"
-            if self.state == FSMState.PLAN_AVOIDANCE and det is not None:
+            if det is not None:
                 clearance_left, clearance_right = self._clearance(det, corridor)
                 if self._pick_side(clearance_left, clearance_right) is None:
                     return True, "no side has provable safe clearance"
+
+        if self.state in MANEUVER_STATES:
             if self.maneuver_started_at is not None and (now - self.maneuver_started_at) > self.maneuver_timeout_s:
                 return True, "avoidance maneuver exceeded its timeout"
 
@@ -304,7 +326,7 @@ class ObstaclePlanner:
     # ------------------------------------------------------------------
     # hysteresis bookkeeping
 
-    def _update_hysteresis(self, det, lane, batch_fresh, effective_corridor):
+    def _update_hysteresis(self, det, lane, batch_fresh, corridor):
         if not batch_fresh:
             # no information either way - do NOT count this as clearance
             # evidence (that's the point of tracking it separately from
@@ -313,7 +335,7 @@ class ObstaclePlanner:
             return
         self.no_data_count = 0
 
-        relevant = self._is_relevant(det, lane, effective_corridor)
+        relevant = self._is_relevant(det, lane, corridor)
         if relevant:
             self.detect_confirm_count += 1
             self.clear_confirm_count = 0
@@ -321,19 +343,15 @@ class ObstaclePlanner:
             self.clear_confirm_count += 1
             self.detect_confirm_count = 0
 
-    def _is_relevant(self, det, lane, effective_corridor) -> bool:
+    def _is_relevant(self, det, lane, corridor) -> bool:
         if det is None:
             return False
         policy = self._policy_for(det.class_name)
         if policy.use_pedestrian_corridor:
-            # person policy never reaches a state where frozen_corridor is
-            # set (attempt_avoid=False keeps it out of PLAN_AVOIDANCE, and
-            # stop_immediately intercepts earlier in _check_emergency) - it
-            # always needs its own, differently-margined corridor, live.
+            # person policy always needs its own, differently-margined
+            # corridor, not the normal one passed in.
             corridor = lane.corridor(self.vehicle_width_px, self.pedestrian_safety_margin_px,
                                       self.white_right_of_yellow)
-        else:
-            corridor = effective_corridor
         if corridor is None:
             # can't certify a corridor - conservative: don't silently
             # ignore the detection (design doc point 10)
@@ -412,70 +430,78 @@ class ObstaclePlanner:
             clearance_left, clearance_right = self._clearance(det, corridor)
             side = self._pick_side(clearance_left, clearance_right)
             self.passing_side = side
-            self.target_x = self._target_x(det, corridor, side)
-            # Freeze this corridor for the rest of the maneuver - see the
-            # freezing rationale in step(). Captured from the same live
-            # corridor target_x was just computed from, so both stay
-            # mutually consistent for the duration of the pass.
-            self.frozen_corridor = corridor
             self.maneuver_started_at = now
             self._enter_state(FSMState.MOVE_AROUND_OBJECT, now)
             return (PlannerDecision(state=FSMState.MOVE_AROUND_OBJECT, action=Action.AVOID,
                                      passing_side=side, path_blocked=True,
                                      clearance_left=clearance_left, clearance_right=clearance_right,
                                      reason="avoidance planned, moving around object"),
-                    AvoidanceCommand(steering=self._blended_steering(),
+                    AvoidanceCommand(steering=self._scripted_steering(side),
                                       throttle=self.throttle_table[FSMState.MOVE_AROUND_OBJECT],
                                       command_valid=True))
 
+        # MOVE_AROUND_OBJECT / PASS_OBJECT / STEER_BACK: a scripted, timed
+        # maneuver rather than a continuously recomputed live target - see
+        # __init__'s AVOID_*_DURATION_S comment for why. Each phase just
+        # holds a fixed steering value for a fixed duration, using
+        # self.state_entered_at (reset by _enter_state on every
+        # transition) as that phase's own clock; none of them depend on
+        # detecting the object again, since PASS_OBJECT is specifically
+        # the blind-spot phase where that's not possible.
         elif self.state == FSMState.MOVE_AROUND_OBJECT:
-            self.blend_ratio = min(1.0, self.blend_ratio + self.avoidance_blend_step)
-            steering = self._blended_steering()
-            if confirmed_clear:
+            steering = self._scripted_steering(self.passing_side)
+            if (now - self.state_entered_at) >= self.avoid_steer_duration_s:
                 self._enter_state(FSMState.PASS_OBJECT, now)
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=True,
-                                     reason="moving around object"),
+                                     reason="steering toward chosen side"),
                     AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.MOVE_AROUND_OBJECT],
                                       command_valid=True))
 
         elif self.state == FSMState.PASS_OBJECT:
-            steering = self._blended_steering()
-            if confirmed_clear and min_duration_elapsed:
-                self._enter_state(FSMState.RETURN_TO_LANE, now)
-                # Live lane geometry is trusted again from here on - the
-                # object has been passed, so there's no more risk of the
-                # avoidance logic itself getting confused by a neighboring
-                # lane's lines, and LaneFollower needs accurate live
-                # readings to actually re-center the car.
-                self.frozen_corridor = None
+            # Held straight - the object is in a blind spot during this
+            # phase (confirmed on real footage), so this can only be
+            # timed, not confirmed.
+            if (now - self.state_entered_at) >= self.avoid_straight_duration_s:
+                self._enter_state(FSMState.STEER_BACK, now)
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
-                                     reason="passing object, confirming clearance"),
-                    AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.PASS_OBJECT],
+                                     reason="passing object in blind spot, holding straight"),
+                    AvoidanceCommand(steering=0.0, throttle=self.throttle_table[FSMState.PASS_OBJECT],
+                                      command_valid=True))
+
+        elif self.state == FSMState.STEER_BACK:
+            # Opposite direction from MOVE_AROUND_OBJECT - steering back
+            # across to the original lane (white returns to the right,
+            # yellow to the left, for the normal WHITE_RIGHT_OF_YELLOW
+            # convention).
+            steering = self._scripted_steering(self.passing_side, reverse=True)
+            if (now - self.state_entered_at) >= self.avoid_return_duration_s:
+                # blend_ratio starts at full weight on the scripted steering
+                # here and decays to 0 below, so the handoff continues
+                # smoothly from whatever STEER_BACK was just holding rather
+                # than snapping straight to live lane steering.
+                self.blend_ratio = 1.0
+                self._enter_state(FSMState.RETURN_TO_LANE, now)
+            return (PlannerDecision(state=self.state, action=Action.AVOID,
+                                     passing_side=self.passing_side, path_blocked=False,
+                                     reason="steering back across to original lane"),
+                    AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.STEER_BACK],
                                       command_valid=True))
 
         elif self.state == FSMState.RETURN_TO_LANE:
             self.blend_ratio = max(0.0, self.blend_ratio - self.avoidance_blend_step)
             # A genuine blend toward LaneFollower's live steering, not just
-            # a decay of the avoidance offset toward 0 (see design note on
-            # _raw_avoidance_steering). The old version held the OLD
-            # avoidance target's steering (scaled down) for the whole
-            # ramp-down, driving roughly straight regardless of where the
-            # car actually was relative to lane center, then handed off
-            # abruptly to LaneFollower's raw output in a single tick once
-            # blend_ratio hit 0 - if the car had drifted from center
-            # during the maneuver (the normal case), that produced a
-            # sudden, uncorrected jump back to centered driving instead of
-            # a smooth handoff. This interpolates toward the real live
-            # steering LaneFollower wants throughout the ramp-down instead.
-            steering = self.blend_ratio * self._raw_avoidance_steering() + (1.0 - self.blend_ratio) * lane_raw_steering
+            # a decay of the avoidance offset toward 0 - see STEER_BACK's
+            # comment above. Interpolates from STEER_BACK's held scripted
+            # steering value down to whatever LaneFollower currently wants,
+            # rather than snapping abruptly to it in one tick.
+            steering = (self.blend_ratio * self._scripted_steering(self.passing_side, reverse=True)
+                        + (1.0 - self.blend_ratio) * lane_raw_steering)
             if self.blend_ratio <= 0.0 and min_duration_elapsed:
                 self._enter_state(FSMState.FOLLOW_LANE, now)
                 self.passing_side = PassingSide.NONE
-                self.target_x = None
                 self.maneuver_started_at = None
-                self.frozen_corridor = None
                 return (PlannerDecision(state=FSMState.FOLLOW_LANE, action=Action.FOLLOW,
                                          reason="returned to lane"),
                         AvoidanceCommand(command_valid=False))
@@ -531,19 +557,21 @@ class ObstaclePlanner:
             return PassingSide.LEFT if clearance_left >= clearance_right else PassingSide.RIGHT
         return PassingSide.LEFT if left_ok else PassingSide.RIGHT
 
-    def _target_x(self, det: Detection, corridor: Tuple[float, float], side: PassingSide) -> float:
-        c_left, c_right = corridor
-        if side == PassingSide.LEFT:
-            return (c_left + det.bbox.x1) / 2.0
-        return (det.bbox.x2 + c_right) / 2.0
-
-    def _raw_avoidance_steering(self) -> float:
-        if self.target_x is None:
+    def _scripted_steering(self, side: PassingSide, reverse: bool = False) -> float:
+        """
+        Fixed steering magnitude/direction for the scripted pass maneuver
+        (MOVE_AROUND_OBJECT steers toward `side`; STEER_BACK calls this
+        with reverse=True to steer the opposite way, back across to the
+        original lane). AVOID_STEER_POLARITY is a config-only sign flip
+        for correcting a real-hardware left/right mismatch without a code
+        change - see __init__.
+        """
+        if side == PassingSide.NONE:
             return 0.0
-        return self._avoidance_controller.steering_for(self.target_x, self.image_center_x)
-
-    def _blended_steering(self) -> float:
-        return self._raw_avoidance_steering() * self.blend_ratio
+        sign = 1.0 if side == PassingSide.RIGHT else -1.0
+        if reverse:
+            sign = -sign
+        return self.avoid_steer_polarity * self.avoid_steer_magnitude * sign
 
     def _throttle_only_command(self, state: FSMState) -> AvoidanceCommand:
         return AvoidanceCommand(steering=0.0, throttle=self.throttle_table.get(state, 0.0), command_valid=True)

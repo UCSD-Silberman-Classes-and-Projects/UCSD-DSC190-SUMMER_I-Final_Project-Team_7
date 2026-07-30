@@ -753,18 +753,29 @@ THROTTLE_TABLE = {}  # {} uses ObstaclePlanner's own built-in defaults; override
 # e.g. {"rc_car": {"attempt_avoid": False}} to make rc_car stop-only.
 CLASS_POLICY = {}
 
-AVOIDANCE_STEERING_GAIN = -0.01   # proportional gain, same sign/scale convention as PID_P above - untuned guess
-# Caps the avoidance controller's held steering command well below full
-# lock (1.0). It's open-loop (see _AvoidanceController's docstring) - once
-# computed, the SAME value is held for as long as MOVE_AROUND_OBJECT/
-# PASS_OBJECT persists, with nothing tapering it down as the car actually
-# turns. Confirmed on real track footage: an uncapped (1.0) held command
-# over-rotated the car off the actual track entirely before the object
-# was confirmed clear, triggering a real lane-loss emergency stop. 0.5 is
-# an untuned starting point - lower if the car still over-rotates,
-# raise if it can't turn sharply enough to actually clear the object.
-AVOIDANCE_MAX_STEERING = 0.5
-AVOIDANCE_BLEND_STEP = 0.15       # how much the avoidance/lane-follower steering blend shifts per tick (~7 ticks to fully blend)
+AVOIDANCE_STEERING_GAIN = -0.01   # legacy/unused now that MOVE_AROUND_OBJECT/PASS_OBJECT/STEER_BACK are scripted - kept only in case a live-target mode returns later
+AVOIDANCE_MAX_STEERING = 0.5      # legacy/unused, same reason as above
+AVOIDANCE_BLEND_STEP = 0.15       # how much the RETURN_TO_LANE steering blend shifts per tick toward live lane steering (~7 ticks to fully blend)
+
+# ── Scripted pass maneuver (MOVE_AROUND_OBJECT / PASS_OBJECT / STEER_BACK) ──
+# Once a side is picked (PLAN_AVOIDANCE, still using live corridor/
+# clearance - that part is unchanged), the actual pass is a fixed, timed
+# sequence rather than a continuously recomputed live target: steer
+# toward the chosen side, hold straight, steer back. Necessary (not just
+# simpler) because the object goes into a real blind spot once the car is
+# alongside/past it (confirmed on real track footage) - "wait until
+# confirmed clear" cannot work for that middle phase. All four values
+# below are untuned starting points - tune against real runs at your
+# actual throttle; the car needs to physically end up back in its own
+# lane by the time AVOID_RETURN_DURATION_S elapses.
+AVOID_STEER_DURATION_S = 1.0      # phase 1: steering toward the chosen side, crossing the yellow line
+AVOID_STRAIGHT_DURATION_S = 1.5   # phase 2: holding straight while the object is in the blind spot
+AVOID_RETURN_DURATION_S = 1.0     # phase 3: steering back across to the original lane
+AVOID_STEER_MAGNITUDE = 0.5       # fixed steering magnitude held during phases 1 and 3
+# Flip to -1.0 on the car if PassingSide.RIGHT physically steers left (or
+# vice versa) - a config-only fix for a real-hardware sign mismatch,
+# no code change needed.
+AVOID_STEER_POLARITY = 1.0
 
 #
 # PilotArbiter - final steering/throttle chokepoint (donkeycar/parts/pilot_arbiter.py).

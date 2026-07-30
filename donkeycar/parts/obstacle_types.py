@@ -37,6 +37,7 @@ class FSMState(str, Enum):
     PLAN_AVOIDANCE = "PLAN_AVOIDANCE"
     MOVE_AROUND_OBJECT = "MOVE_AROUND_OBJECT"
     PASS_OBJECT = "PASS_OBJECT"
+    STEER_BACK = "STEER_BACK"
     RETURN_TO_LANE = "RETURN_TO_LANE"
     EMERGENCY_STOP = "EMERGENCY_STOP"
 
@@ -204,6 +205,22 @@ class LaneGeometry:
             return None
 
         if self.both_visible:
+            # Sanity check: white should be on the expected side of yellow
+            # (white_right_of_yellow). When it isn't, the two readings have
+            # almost certainly latched onto the wrong lines this frame - a
+            # neighboring track's line, or a curve LaneFollower isn't tuned
+            # for (confirmed on real footage: yellow_x/white_x swapped
+            # order at a corner). corridor()'s (left, right) bounds are
+            # just (smaller_x, larger_x) - it has no memory of which
+            # physical line is which, so a swapped pair silently inverts
+            # the meaning of "left"/"right" for every downstream decision
+            # (avoidance side, target_x), producing a corridor that's
+            # confidently backwards rather than merely imprecise. Refusing
+            # to certify a corridor here (same as "not enough information")
+            # is safer than certifying a wrong one.
+            sign = 1.0 if white_right_of_yellow else -1.0
+            if sign * (self.white_x - self.yellow_x) <= 0:
+                return None
             center = (self.yellow_x + self.white_x) / 2.0
             # self.width_px is a smoothed/persisted estimate that can lag
             # behind reality (e.g. still narrow from an earlier bad

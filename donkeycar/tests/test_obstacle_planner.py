@@ -140,29 +140,37 @@ class TestConeAvoidance(unittest.TestCase):
         self.assertFalse(command.command_valid)
 
     def test_returns_to_lane_after_clearing(self):
-        planner = ObstaclePlanner(make_cfg())
+        # Scripted timed maneuver (MOVE_AROUND_OBJECT/PASS_OBJECT/
+        # STEER_BACK) - deliberately NOT confirmed-clear-driven, since the
+        # object is in a real blind spot during the pass. Short durations
+        # here just so the test doesn't need many ticks.
+        cfg = make_cfg(AVOID_STEER_DURATION_S=0.1, AVOID_STRAIGHT_DURATION_S=0.1,
+                        AVOID_RETURN_DURATION_S=0.1)
+        planner = ObstaclePlanner(cfg)
         _, _, now = self._drive_into_avoidance(planner, (100, 180, 130, 220), distance_mm=900)
         self.assertEqual(FSMState.MOVE_AROUND_OBJECT, planner.state)
 
-        # object clears - a FRESH reading with nothing detected is genuine
-        # clear evidence (not to be confused with a stale/missing reading,
-        # which is invalid data - see _update_hysteresis). CLEAR_CONFIRM_FRAMES=2
-        # ticks of this -> PASS_OBJECT.
-        for _ in range(2):
-            now += 0.05
-            decision, command = planner.step(pin(detections(timestamp=now), lane(), now=now))
+        # AVOID_STEER_DURATION_S elapses -> PASS_OBJECT. No detection at
+        # all during this - the object is in a blind spot by design, so
+        # nothing about this transition depends on re-detecting it.
+        now += 0.15
+        decision, command = planner.step(pin(detections(), lane(), now=now))
         self.assertEqual(FSMState.PASS_OBJECT, planner.state)
 
-        # another CLEAR_CONFIRM_FRAMES ticks clear -> RETURN_TO_LANE
-        for _ in range(2):
-            now += 0.05
-            decision, command = planner.step(pin(detections(timestamp=now), lane(), now=now))
+        # AVOID_STRAIGHT_DURATION_S elapses -> STEER_BACK
+        now += 0.15
+        decision, command = planner.step(pin(detections(), lane(), now=now))
+        self.assertEqual(FSMState.STEER_BACK, planner.state)
+
+        # AVOID_RETURN_DURATION_S elapses -> RETURN_TO_LANE
+        now += 0.15
+        decision, command = planner.step(pin(detections(), lane(), now=now))
         self.assertEqual(FSMState.RETURN_TO_LANE, planner.state)
 
         # blend ratio eases back to 0 (AVOIDANCE_BLEND_STEP=0.5 -> 2 more ticks) -> FOLLOW_LANE
         for _ in range(3):
             now += 0.05
-            decision, command = planner.step(pin(detections(timestamp=now), lane(), now=now))
+            decision, command = planner.step(pin(detections(), lane(), now=now))
         self.assertEqual(FSMState.FOLLOW_LANE, planner.state)
         self.assertFalse(command.command_valid)
         self.assertEqual(PassingSide.NONE, planner.passing_side)
