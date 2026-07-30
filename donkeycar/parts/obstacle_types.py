@@ -259,6 +259,12 @@ class PlannerInput:
     # RETURN_TO_LANE branch). Defaults to 0.0 so existing callers/tests
     # that don't care about the return-to-lane handoff are unaffected.
     lane_raw_steering: float = 0.0
+    # LaneFollower's own current raw throttle (pilot/throttle_raw) - used
+    # during the scripted maneuver states (MOVE_AROUND_OBJECT/PASS_OBJECT/
+    # STEER_BACK/RETURN_TO_LANE) so the car swerves at whatever speed it
+    # was already driving, instead of a separate fixed THROTTLE_TABLE
+    # value. Defaults to 0.0 for the same reason as lane_raw_steering.
+    lane_raw_throttle: float = 0.0
 
 
 @dataclass

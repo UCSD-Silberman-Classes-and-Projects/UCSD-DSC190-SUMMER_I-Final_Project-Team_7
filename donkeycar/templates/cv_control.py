@@ -165,7 +165,7 @@ def drive(cfg, use_joystick=False, camera_type='single', meta=[]):
                       'object/depth_valid_pixel_count', 'object/frame_id',
                       'object/timestamp', 'object/raw_detections',
                       'lane/yellow_x', 'lane/white_x', 'lane/width_px', 'lane/lost_frames',
-                      'run_pilot', 'pilot/steering_raw'],
+                      'run_pilot', 'pilot/steering_raw', 'pilot/throttle_raw'],
               outputs=['avoidance/steering', 'avoidance/throttle',
                        'avoidance/command_valid', 'avoidance/emergency_stop',
                        'avoidance/state', 'avoidance/action', 'avoidance/target_x',

@@ -61,8 +61,10 @@ def detections(class_name=None, confidence=0.9, bbox=None, distance_mm=None, dis
     return DetectionBatch(raw_detections=[det], selected=det, inference_timestamp=timestamp, frame_id=1)
 
 
-def pin(det_batch, lane_geo, now=0.0, pilot_mode=True, mode=OperatingMode.ACTIVE):
-    return PlannerInput(detections=det_batch, lane=lane_geo, mode=mode, pilot_mode=pilot_mode, now=now)
+def pin(det_batch, lane_geo, now=0.0, pilot_mode=True, mode=OperatingMode.ACTIVE,
+        lane_raw_steering=0.0, lane_raw_throttle=0.0):
+    return PlannerInput(detections=det_batch, lane=lane_geo, mode=mode, pilot_mode=pilot_mode, now=now,
+                        lane_raw_steering=lane_raw_steering, lane_raw_throttle=lane_raw_throttle)
 
 
 class TestNotInPilotMode(unittest.TestCase):
@@ -100,7 +102,7 @@ class TestConeAvoidance(unittest.TestCase):
             decision, command = planner.step(
                 pin(detections('traffic_cone', bbox=cone_bbox, distance_mm=distance_mm, distance_valid=True,
                                 timestamp=now),
-                    lane(), now=now))
+                    lane(), now=now, lane_raw_throttle=0.3))
         return decision, command, now
 
     def test_cone_in_corridor_triggers_avoidance_with_more_room_on_the_right(self):

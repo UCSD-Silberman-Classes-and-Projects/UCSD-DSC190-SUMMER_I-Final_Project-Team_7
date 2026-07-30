@@ -168,22 +168,6 @@ class ObstaclePlanner:
         self.cleared_distance_mm = getattr(cfg, 'CLEARED_DISTANCE_MM', 2000)
         self.cleared_bbox_height_px = getattr(cfg, 'CLEARED_BBOX_HEIGHT_PX', 60)
 
-        # Throttle per state - reverse disabled by default; EMERGENCY_STOP
-        # is always exactly 0.0, not read from this table (see design doc
-        # point 16). FOLLOW_LANE isn't here either - command_valid is False
-        # in that state, so LaneFollower's own throttle passes straight
-        # through the arbiter unmodified.
-        default_throttle_table = {
-            FSMState.OBJECT_DETECTED: 0.15,
-            FSMState.PLAN_AVOIDANCE: 0.12,
-            FSMState.MOVE_AROUND_OBJECT: 0.12,
-            FSMState.PASS_OBJECT: 0.12,
-            FSMState.STEER_BACK: 0.12,
-            FSMState.RETURN_TO_LANE: 0.18,
-        }
-        configured = getattr(cfg, 'THROTTLE_TABLE', {}) or {}
-        self.throttle_table = {**default_throttle_table, **configured}
-
         policy_overrides = getattr(cfg, 'CLASS_POLICY', {}) or {}
         self.class_policy: Dict[str, ClassPolicy] = dict(DEFAULT_CLASS_POLICY)
         for class_name, kwargs in policy_overrides.items():
@@ -329,7 +313,7 @@ class ObstaclePlanner:
                                      path_blocked=True, reason=self.emergency_reason),
                     AvoidanceCommand(steering=0.0, throttle=0.0, command_valid=True, emergency_stop=True))
 
-        return self._step_fsm(det, lane, corridor, pin.now, pin.lane_raw_steering)
+        return self._step_fsm(det, lane, corridor, pin.now, pin.lane_raw_steering, pin.lane_raw_throttle)
 
     # ------------------------------------------------------------------
     # emergency layer - checked every tick, ahead of normal FSM transitions
@@ -422,7 +406,8 @@ class ObstaclePlanner:
     # ------------------------------------------------------------------
     # normal (non-emergency) FSM
 
-    def _step_fsm(self, det, lane, corridor, now, lane_raw_steering=0.0) -> Tuple[PlannerDecision, AvoidanceCommand]:
+    def _step_fsm(self, det, lane, corridor, now, lane_raw_steering=0.0,
+                  lane_raw_throttle=0.0) -> Tuple[PlannerDecision, AvoidanceCommand]:
         """
         Exactly one state transition per call, using an elif chain (not a
         cascade of independent ifs): if a transition happens, this tick
@@ -456,7 +441,10 @@ class ObstaclePlanner:
             # that an extra forced slowdown right before the swerve was
             # doing more harm than good. Normal speed continues right up
             # until MOVE_AROUND_OBJECT actually commits to the lane
-            # switch, which still has its own throttle_table entry.
+            # switch, which uses LaneFollower's own live throttle (see
+            # lane_raw_throttle in run()/_step_fsm) rather than a fixed
+            # value - user feedback: the maneuver should move at whatever
+            # speed the car was already driving, not a separate number.
             if confirmed_present and det is not None \
                     and self._closer_than(det, self.detect_distance_mm, self.detect_bbox_height_px):
                 self._enter_state(FSMState.OBJECT_DETECTED, now)
@@ -507,7 +495,7 @@ class ObstaclePlanner:
                                      clearance_left=clearance_left, clearance_right=clearance_right,
                                      reason="avoidance planned, moving around object"),
                     AvoidanceCommand(steering=self._scripted_steering(side),
-                                      throttle=self.throttle_table[FSMState.MOVE_AROUND_OBJECT],
+                                      throttle=lane_raw_throttle,
                                       command_valid=True))
 
         # MOVE_AROUND_OBJECT / PASS_OBJECT / STEER_BACK: a scripted, timed
@@ -525,7 +513,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=True,
                                      reason="steering toward chosen side"),
-                    AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.MOVE_AROUND_OBJECT],
+                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
                                       command_valid=True))
 
         elif self.state == FSMState.PASS_OBJECT:
@@ -537,7 +525,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="passing object in blind spot, holding straight"),
-                    AvoidanceCommand(steering=0.0, throttle=self.throttle_table[FSMState.PASS_OBJECT],
+                    AvoidanceCommand(steering=0.0, throttle=lane_raw_throttle,
                                       command_valid=True))
 
         elif self.state == FSMState.STEER_BACK:
@@ -556,7 +544,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="steering back across to original lane"),
-                    AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.STEER_BACK],
+                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
                                       command_valid=True))
 
         elif self.state == FSMState.RETURN_TO_LANE:
@@ -578,7 +566,7 @@ class ObstaclePlanner:
             return (PlannerDecision(state=self.state, action=Action.AVOID,
                                      passing_side=self.passing_side, path_blocked=False,
                                      reason="easing back to lane center"),
-                    AvoidanceCommand(steering=steering, throttle=self.throttle_table[FSMState.RETURN_TO_LANE],
+                    AvoidanceCommand(steering=steering, throttle=lane_raw_throttle,
                                       command_valid=True))
 
         # Unreachable in practice, but keeps a defined fallback if a new
@@ -658,7 +646,7 @@ class ObstaclePlanner:
             object_distance_mm, object_distance_valid, object_depth_valid_pixel_count,
             object_frame_id, object_timestamp, object_raw_detections,
             lane_yellow_x, lane_white_x, lane_width_px, lane_lost_frames,
-            run_pilot, pilot_steering_raw=0.0):
+            run_pilot, pilot_steering_raw=0.0, pilot_throttle_raw=0.0):
         now = time.monotonic()
         detections = detection_batch_from_memory(
             object_class, object_confidence, object_bbox, object_distance_mm,
@@ -668,7 +656,8 @@ class ObstaclePlanner:
                                           lane_lost_frames, self.max_accepted_lane_stale_frames)
         pin = PlannerInput(detections=detections, lane=lane, mode=self.mode,
                             pilot_mode=bool(run_pilot), now=now,
-                            lane_raw_steering=pilot_steering_raw if pilot_steering_raw is not None else 0.0)
+                            lane_raw_steering=pilot_steering_raw if pilot_steering_raw is not None else 0.0,
+                            lane_raw_throttle=pilot_throttle_raw if pilot_throttle_raw is not None else 0.0)
 
         decision, command = self.step(pin)
 
