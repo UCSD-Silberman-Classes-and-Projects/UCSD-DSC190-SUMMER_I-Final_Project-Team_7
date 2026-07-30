@@ -54,6 +54,26 @@ MANEUVER_STATES = frozenset([
     FSMState.STEER_BACK, FSMState.RETURN_TO_LANE,
 ])
 
+# States where the object being avoided is expected to be genuinely out of
+# camera view by design (PASS_OBJECT's own docstring: "the object is in a
+# blind spot during this phase"; STEER_BACK likewise, by then behind/beside
+# the car on the way back). Checks that depend on freshly re-detecting THAT
+# object - "is it still close," "is detector data missing" - must not fire
+# here: a lack of fresh data, or a stale-but-still-"fresh" cached reading
+# from the object's last real sighting right before it left frame
+# (naturally closest/largest then, since the swerve is what put it out of
+# view), are the expected condition, not a fault. Confirmed as the cause of
+# a premature EMERGENCY_STOP partway through PASS_OBJECT on real track
+# testing. Deliberately NOT including MOVE_AROUND_OBJECT - the object may
+# still be genuinely in view during that initial turn-in, so its existing
+# behavior (see test_stale_detection_during_active_maneuver_eventually_
+# triggers_emergency) is unchanged. Also deliberately NOT touching the
+# person/stop_immediately check or the maneuver-timeout check below - both
+# are state-independent safety nets that must keep running everywhere.
+BLIND_SPOT_STATES = frozenset([
+    FSMState.PASS_OBJECT, FSMState.STEER_BACK,
+])
+
 
 @dataclass
 class ClassPolicy:
@@ -271,6 +291,15 @@ class ObstaclePlanner:
 
         emergency, reason = self._check_emergency(det, lane, corridor, pin.now)
         if emergency:
+            if not self.emergency_latched:
+                state_age = pin.now - self.state_entered_at if self.state_entered_at is not None else -1.0
+                det_age = det_batch.age(pin.now)
+                logger.info(
+                    f"ObstaclePlanner: EMERGENCY_STOP triggered from {self.state.value} "
+                    f"(in-state {state_age:.2f}s) - reason: {reason} | "
+                    f"det={'none' if det is None else f'{det.class_name} conf={det.confidence:.2f} dist={det.distance_mm}'} "
+                    f"batch_fresh={batch_fresh} det_age={det_age:.2f}s no_data_count={self.no_data_count} | "
+                    f"lane_loss_ticks={self.lane_loss_ticks} corridor={corridor}")
             self.emergency_latched = True
             self.emergency_reason = reason
         if self.emergency_latched:
@@ -296,14 +325,25 @@ class ObstaclePlanner:
                 if ped_corridor is None or det.bbox.overlaps_x(*ped_corridor):
                     return True, f"person detected in/near driving corridor (class={det.class_name})"
 
-            if self._closer_than(det, self.emergency_stop_distance_mm, self.emergency_stop_bbox_height_px):
-                return True, "object critically close"
+            # Skipped during the blind-spot phases - see BLIND_SPOT_STATES.
+            # A fresh, non-blind-spot "det" here is a real, current
+            # sighting and this check still applies normally everywhere
+            # else (including MOVE_AROUND_OBJECT, where the object may
+            # still be genuinely in view).
+            if self.state not in BLIND_SPOT_STATES:
+                if self._closer_than(det, self.emergency_stop_distance_mm, self.emergency_stop_bbox_height_px):
+                    return True, "object critically close"
 
         if self.state in ENGAGED_STATES:
             if self.lane_loss_ticks > self.lane_loss_emergency_ticks:
                 return True, "lane boundaries lost/stale while engaged with an object"
-            if self.no_data_count > self.max_no_data_ticks_during_maneuver:
-                return True, "detector data invalid/missing during an active maneuver"
+            # Skipped during the blind-spot phases - see BLIND_SPOT_STATES.
+            # A sustained lack of fresh detector data there is the
+            # expected condition (the object can't be re-detected by
+            # design), not evidence of a detector fault.
+            if self.state not in BLIND_SPOT_STATES:
+                if self.no_data_count > self.max_no_data_ticks_during_maneuver:
+                    return True, "detector data invalid/missing during an active maneuver"
 
         # Corridor/side-safety only checked in PLAN_AVOIDANCE - that's the
         # only remaining state that depends on live corridor geometry for

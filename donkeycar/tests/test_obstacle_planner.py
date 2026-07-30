@@ -175,6 +175,43 @@ class TestConeAvoidance(unittest.TestCase):
         self.assertFalse(command.command_valid)
         self.assertEqual(PassingSide.NONE, planner.passing_side)
 
+    def test_blind_spot_states_tolerate_missing_or_stale_close_detection(self):
+        # Regression test for a real bug found on-car: PASS_OBJECT is the
+        # scripted blind-spot phase (the object can't be re-detected by
+        # design), but the emergency layer wasn't scoped to account for
+        # that - a stale-but-still-"fresh" cached detection of the
+        # object's last close sighting right before it left frame (or a
+        # sustained lack of fresh detector data) incorrectly triggered a
+        # premature EMERGENCY_STOP mid-pass.
+        cfg = make_cfg(MAX_NO_DATA_TICKS_DURING_MANEUVER=2, AVOID_STEER_DURATION_S=0.1,
+                        AVOID_STRAIGHT_DURATION_S=1.0, AVOID_RETURN_DURATION_S=0.1)
+        planner = ObstaclePlanner(cfg)
+        _, _, now = self._drive_into_avoidance(planner, (100, 180, 130, 220), distance_mm=900)
+        self.assertEqual(FSMState.MOVE_AROUND_OBJECT, planner.state)
+
+        now += 0.15
+        planner.step(pin(detections(), lane(), now=now))
+        self.assertEqual(FSMState.PASS_OBJECT, planner.state)
+
+        # A stale-but-fresh cached detection of the cone well past the
+        # EMERGENCY_STOP_DISTANCE_MM/BBOX_HEIGHT_PX thresholds (its last
+        # real sighting, naturally close since the swerve just put it out
+        # of frame) must not be treated as a currently-close object here.
+        close_stale = detections('traffic_cone', bbox=(150, 100, 300, 240), distance_mm=100,
+                                  distance_valid=True, timestamp=now)
+        for _ in range(4):
+            now += 0.05
+            planner.step(pin(close_stale, lane(), now=now))
+        self.assertEqual(FSMState.PASS_OBJECT, planner.state)
+
+        # A sustained lack of fresh detector data (the expected condition
+        # during the blind spot) must not trip the no-data check either.
+        stale_batch = DetectionBatch(inference_timestamp=now - 10.0, selected=None)
+        for _ in range(4):
+            now += 0.05
+            planner.step(pin(stale_batch, lane(), now=now))
+        self.assertEqual(FSMState.PASS_OBJECT, planner.state)
+
 
 class TestRcCar(unittest.TestCase):
 
