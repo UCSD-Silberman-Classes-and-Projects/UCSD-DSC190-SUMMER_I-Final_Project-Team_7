@@ -226,6 +226,22 @@ class ObstaclePlanner:
         # change to correct a real-hardware sign mismatch.
         self.avoid_steer_polarity = getattr(cfg, 'AVOID_STEER_POLARITY', 1.0)
 
+        # Each emergency check individually toggleable via myconfig.py -
+        # all default True (unchanged behavior). PERSON and LANE_LOSS
+        # default on and are the recommended ones to always leave on (a
+        # real person near the path, or total loss of the track, are the
+        # two conditions most likely to matter if something genuinely
+        # goes wrong) - the others (critically-close, stale-data,
+        # no-safe-side, maneuver-timeout) are the ones observed to
+        # false-positive during testing and are safe to disable if they're
+        # causing more trouble than they prevent for a given demo/course.
+        self.enable_person_stop = getattr(cfg, 'ENABLE_PERSON_EMERGENCY_STOP', True)
+        self.enable_critically_close_stop = getattr(cfg, 'ENABLE_CRITICALLY_CLOSE_EMERGENCY_STOP', True)
+        self.enable_lane_loss_stop = getattr(cfg, 'ENABLE_LANE_LOSS_EMERGENCY_STOP', True)
+        self.enable_no_data_stop = getattr(cfg, 'ENABLE_NO_DATA_EMERGENCY_STOP', True)
+        self.enable_no_safe_side_stop = getattr(cfg, 'ENABLE_NO_SAFE_SIDE_EMERGENCY_STOP', True)
+        self.enable_maneuver_timeout_stop = getattr(cfg, 'ENABLE_MANEUVER_TIMEOUT_EMERGENCY_STOP', True)
+
         # Read once at construction, not per tick - OBSTACLE_AVOIDANCE_MODE
         # doesn't change during a drive() session, and step()'s own FSM
         # logic doesn't branch on it anyway (see design doc: mode-based
@@ -321,7 +337,7 @@ class ObstaclePlanner:
     def _check_emergency(self, det, lane, corridor, now) -> Tuple[bool, str]:
         if det is not None:
             policy = self._policy_for(det.class_name)
-            if policy.stop_immediately:
+            if self.enable_person_stop and policy.stop_immediately:
                 margin = self.pedestrian_safety_margin_px
                 ped_corridor = lane.corridor(self.vehicle_width_px, margin, self.white_right_of_yellow)
                 # can't prove the person is clear of an expanded corridor we
@@ -335,18 +351,18 @@ class ObstaclePlanner:
             # sighting and this check still applies normally everywhere
             # else (including MOVE_AROUND_OBJECT, where the object may
             # still be genuinely in view).
-            if self.state not in BLIND_SPOT_STATES:
+            if self.enable_critically_close_stop and self.state not in BLIND_SPOT_STATES:
                 if self._closer_than(det, self.emergency_stop_distance_mm, self.emergency_stop_bbox_height_px):
                     return True, "object critically close"
 
         if self.state in ENGAGED_STATES:
-            if self.lane_loss_ticks > self.lane_loss_emergency_ticks:
+            if self.enable_lane_loss_stop and self.lane_loss_ticks > self.lane_loss_emergency_ticks:
                 return True, "lane boundaries lost/stale while engaged with an object"
             # Skipped during the blind-spot phases - see BLIND_SPOT_STATES.
             # A sustained lack of fresh detector data there is the
             # expected condition (the object can't be re-detected by
             # design), not evidence of a detector fault.
-            if self.state not in BLIND_SPOT_STATES:
+            if self.enable_no_data_stop and self.state not in BLIND_SPOT_STATES:
                 if self.no_data_count > self.max_no_data_ticks_during_maneuver:
                     return True, "detector data invalid/missing during an active maneuver"
 
@@ -354,7 +370,7 @@ class ObstaclePlanner:
         # only remaining state that depends on live corridor geometry for
         # a decision (see MOVE_AROUND_OBJECT/PASS_OBJECT/STEER_BACK's
         # scripted-timing docstring note for why they deliberately don't).
-        if self.state == FSMState.PLAN_AVOIDANCE:
+        if self.enable_no_safe_side_stop and self.state == FSMState.PLAN_AVOIDANCE:
             if corridor is None:
                 return True, "no safe passing corridor exists"
             if det is not None:
@@ -362,7 +378,7 @@ class ObstaclePlanner:
                 if self._pick_side(clearance_left, clearance_right) is None:
                     return True, "no side has provable safe clearance"
 
-        if self.state in MANEUVER_STATES:
+        if self.enable_maneuver_timeout_stop and self.state in MANEUVER_STATES:
             if self.maneuver_started_at is not None and (now - self.maneuver_started_at) > self.maneuver_timeout_s:
                 return True, "avoidance maneuver exceeded its timeout"
 
