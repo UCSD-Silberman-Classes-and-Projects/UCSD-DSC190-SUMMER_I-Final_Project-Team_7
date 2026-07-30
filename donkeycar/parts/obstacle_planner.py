@@ -218,6 +218,14 @@ class ObstaclePlanner:
         # LaneFollower's live value is lower.
         self.min_maneuver_throttle = getattr(cfg, 'MIN_MANEUVER_THROTTLE', 0.15)
 
+        # None (default) = pick whichever side has more real clearance,
+        # as before. "left"/"right" forces every pass to that side only -
+        # see _pick_side. Useful on a two-lane road where only one side
+        # of a cone is ever a real lane (the other is the outer edge/
+        # curb, not a second lane, regardless of raw pixel clearance).
+        forced_side = getattr(cfg, 'FORCED_PASSING_SIDE', None)
+        self.forced_passing_side = PassingSide(forced_side) if forced_side else None
+
         # Each emergency check individually toggleable via myconfig.py -
         # all default True (unchanged behavior). PERSON and LANE_LOSS
         # default on and are the recommended ones to always leave on (a
@@ -625,6 +633,20 @@ class ObstaclePlanner:
         required = self.vehicle_width_px + self.pass_clearance_margin_px
         left_ok = clearance_left >= required
         right_ok = clearance_right >= required
+
+        # FORCED_PASSING_SIDE (myconfig.py) restricts this to a single
+        # side always - e.g. on a two-lane road, "right" of a cone may
+        # just be the outer edge/curb, not a real second lane, so
+        # "whichever side has more raw pixel clearance" isn't actually a
+        # valid choice there. Only that side is ever considered; if it
+        # isn't safe, this returns None same as "no safe side" normally
+        # does (routes to EMERGENCY_STOP) rather than falling back to the
+        # other (not a real lane) side.
+        if self.forced_passing_side == PassingSide.LEFT:
+            return PassingSide.LEFT if left_ok else None
+        if self.forced_passing_side == PassingSide.RIGHT:
+            return PassingSide.RIGHT if right_ok else None
+
         if not left_ok and not right_ok:
             return None
         if left_ok and right_ok:
