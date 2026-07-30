@@ -233,6 +233,11 @@ class ObstaclePlanner:
         # needing a dummy Memory key just to shuttle a static string in.
         self.mode = OperatingMode(getattr(cfg, 'OBSTACLE_AVOIDANCE_MODE', 'disabled'))
 
+        # See run()'s periodic status heartbeat - time.monotonic()-based
+        # throttle, independent of state transitions.
+        self.status_log_interval_s = getattr(cfg, 'STATUS_LOG_INTERVAL_S', 1.0)
+        self._last_status_log_at = 0.0
+
         self.reset()
 
     def reset(self):
@@ -644,6 +649,27 @@ class ObstaclePlanner:
                             lane_raw_steering=pilot_steering_raw if pilot_steering_raw is not None else 0.0)
 
         decision, command = self.step(pin)
+
+        # Periodic status heartbeat, independent of state transitions -
+        # _enter_state only logs when the state actually changes, which
+        # says nothing about what the detector/lane data looked like on
+        # any given tick in between. This fills that gap: a
+        # STATUS_LOG_INTERVAL_S-spaced snapshot of the full picture, so a
+        # run can be reviewed after the fact (see OBSTACLE_AVOIDANCE.md)
+        # instead of needing a screenshot at the exact moment something
+        # looked wrong.
+        if now - self._last_status_log_at >= self.status_log_interval_s:
+            self._last_status_log_at = now
+            det = detections.selected
+            det_str = ('none' if det is None else
+                       f"{det.class_name} conf={det.confidence:.2f} "
+                       f"dist={det.distance_mm} valid={det.distance_valid} "
+                       f"bbox_h={det.bbox.height:.0f}")
+            logger.info(
+                f"ObstaclePlanner status: state={decision.state.value} action={decision.action.value} "
+                f"side={decision.passing_side.value} blocked={decision.path_blocked} | "
+                f"det={det_str} | lane_width={lane_width_px} lost_frames={lane_lost_frames} | "
+                f"steering={command.steering:.2f} throttle={command.throttle:.2f}")
 
         return (command.steering, command.throttle, command.command_valid, command.emergency_stop,
                 decision.state.value, decision.action.value,

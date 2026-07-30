@@ -11,10 +11,16 @@ trusting "active" mode: see the design doc's staged rollout (observe ->
 shadow -> active).
 """
 
+import logging
+import os
+import time
+
 import cv2
 import numpy as np
 
 from donkeycar.parts.obstacle_types import LaneGeometry
+
+logger = logging.getLogger(__name__)
 
 
 class ObstacleOverlay:
@@ -31,6 +37,23 @@ class ObstacleOverlay:
         # this is a schematic overlay, not a measurement.
         self.overlay_y = getattr(cfg, 'OBSTACLE_OVERLAY_Y', 130)
         self.overlay_height = getattr(cfg, 'OBSTACLE_OVERLAY_HEIGHT', 30)
+
+        # Optional: save this exact annotated frame to disk periodically
+        # while the planner is actively engaged (any state other than
+        # FOLLOW_LANE) - lets a test run be reviewed afterward by pairing
+        # each saved image's filename/timestamp against the matching
+        # ObstaclePlanner log lines (see OBSTACLE_AVOIDANCE.md), instead
+        # of relying on a live screenshot at the moment something looks
+        # wrong. Off by default (adds disk I/O) - opt in via
+        # SAVE_OBSTACLE_SNAPSHOTS = True in myconfig.py.
+        self.save_snapshots = getattr(cfg, 'SAVE_OBSTACLE_SNAPSHOTS', False)
+        self.snapshot_interval_s = getattr(cfg, 'OBSTACLE_SNAPSHOT_INTERVAL_S', 0.5)
+        data_path = getattr(cfg, 'DATA_PATH', '.')
+        self.snapshot_dir = getattr(cfg, 'OBSTACLE_SNAPSHOT_DIR',
+                                     os.path.join(data_path, 'obstacle_snapshots'))
+        self._last_snapshot_at = 0.0
+        if self.save_snapshots:
+            os.makedirs(self.snapshot_dir, exist_ok=True)
 
     def run(self, cam_img, object_class, object_confidence, object_bbox,
             object_distance_mm, object_distance_valid,
@@ -81,6 +104,18 @@ class ObstacleOverlay:
             cv2.putText(img, s, org=(10, y), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                         fontScale=0.4, color=(255, 255, 255), thickness=1)
             y += 10
+
+        if self.save_snapshots and avoidance_state != 'FOLLOW_LANE':
+            now = time.time()
+            if now - self._last_snapshot_at >= self.snapshot_interval_s:
+                self._last_snapshot_at = now
+                filename = f"{now:.2f}_{avoidance_state}.jpg"
+                path = os.path.join(self.snapshot_dir, filename)
+                # img is RGB (same convention as cam_img throughout this
+                # codebase) - cv2.imwrite expects BGR.
+                ok = cv2.imwrite(path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                if not ok:
+                    logger.warning(f"ObstacleOverlay: failed to write snapshot to {path}")
 
         return img
 
