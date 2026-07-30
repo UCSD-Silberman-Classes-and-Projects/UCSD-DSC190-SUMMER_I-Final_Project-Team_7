@@ -496,13 +496,22 @@ class ObstaclePlanner:
                 return (PlannerDecision(state=FSMState.PLAN_AVOIDANCE, action=Action.SLOW,
                                          reason="no current detection while planning"),
                         AvoidanceCommand(command_valid=False))
-            # corridor==None and "no side safe" are both already routed to
-            # EMERGENCY_STOP by _check_emergency before we get here (this
-            # only holds because PLAN_AVOIDANCE persists for a full tick
-            # before this block runs - see the docstring above), so a side
-            # is guaranteed to exist here.
+            # corridor==None and "no side safe" are normally already
+            # routed to EMERGENCY_STOP by _check_emergency before we get
+            # here - but that check is now individually disable-able
+            # (ENABLE_NO_SAFE_SIDE_EMERGENCY_STOP), so this can no longer
+            # assume it always ran. Guard directly: a None side must
+            # never proceed into MOVE_AROUND_OBJECT (confirmed crash on
+            # real hardware otherwise - self.passing_side ending up a
+            # bare None instead of a PassingSide enum). Hold in
+            # PLAN_AVOIDANCE instead, same as the "no current detection"
+            # case above.
             clearance_left, clearance_right = self._clearance(det, corridor)
             side = self._pick_side(clearance_left, clearance_right)
+            if side is None:
+                return (PlannerDecision(state=FSMState.PLAN_AVOIDANCE, action=Action.SLOW,
+                                         reason="no side has provable safe clearance"),
+                        AvoidanceCommand(command_valid=False))
             self.passing_side = side
             self.maneuver_started_at = now
             self._enter_state(FSMState.MOVE_AROUND_OBJECT, now)
@@ -638,14 +647,14 @@ class ObstaclePlanner:
         # side always - e.g. on a two-lane road, "right" of a cone may
         # just be the outer edge/curb, not a real second lane, so
         # "whichever side has more raw pixel clearance" isn't actually a
-        # valid choice there. Only that side is ever considered; if it
-        # isn't safe, this returns None same as "no safe side" normally
-        # does (routes to EMERGENCY_STOP) rather than falling back to the
-        # other (not a real lane) side.
+        # valid choice there. Unconditionally valid - user confirmed the
+        # forced side always has real room on this course, so the
+        # clearance check is skipped entirely for it (never returns None
+        # here, unlike the unforced path below).
         if self.forced_passing_side == PassingSide.LEFT:
-            return PassingSide.LEFT if left_ok else None
+            return PassingSide.LEFT
         if self.forced_passing_side == PassingSide.RIGHT:
-            return PassingSide.RIGHT if right_ok else None
+            return PassingSide.RIGHT
 
         if not left_ok and not right_ok:
             return None
