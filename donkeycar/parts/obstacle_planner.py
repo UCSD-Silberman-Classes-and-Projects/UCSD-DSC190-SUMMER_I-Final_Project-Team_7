@@ -426,18 +426,27 @@ class ObstaclePlanner:
         if self.state == FSMState.FOLLOW_LANE:
             # Note: NOT gated on the class policy's attempt_avoid here -
             # any relevant, close-enough object should at least be
-            # acknowledged (and slowed for) in OBJECT_DETECTED; attempt_avoid
-            # only gates whether OBJECT_DETECTED is allowed to proceed on to
+            # acknowledged in OBJECT_DETECTED; attempt_avoid only gates
+            # whether OBJECT_DETECTED is allowed to proceed on to
             # PLAN_AVOIDANCE below. Gating it here too would mean an
-            # unknown-class object (attempt_avoid=False) never even
-            # triggers a slow-down, which isn't the intended "conservative"
+            # unknown-class object (attempt_avoid=False) never even gets
+            # acknowledged, which isn't the intended "conservative"
             # behavior for __unknown__.
+            #
+            # OBJECT_DETECTED/PLAN_AVOIDANCE no longer force a reduced
+            # throttle (command_valid=False lets LaneFollower's own
+            # steering/throttle pass straight through unmodified) - user
+            # feedback: the baseline cruising speed is already slow enough
+            # that an extra forced slowdown right before the swerve was
+            # doing more harm than good. Normal speed continues right up
+            # until MOVE_AROUND_OBJECT actually commits to the lane
+            # switch, which still has its own throttle_table entry.
             if confirmed_present and det is not None \
                     and self._closer_than(det, self.detect_distance_mm, self.detect_bbox_height_px):
                 self._enter_state(FSMState.OBJECT_DETECTED, now)
                 return (PlannerDecision(state=FSMState.OBJECT_DETECTED, action=Action.SLOW,
                                          reason="object detected"),
-                        self._throttle_only_command(FSMState.OBJECT_DETECTED))
+                        AvoidanceCommand(command_valid=False))
             return (PlannerDecision(state=FSMState.FOLLOW_LANE, action=Action.FOLLOW,
                                      reason="no relevant object in corridor"),
                     AvoidanceCommand(command_valid=False))
@@ -454,10 +463,10 @@ class ObstaclePlanner:
                 self._enter_state(FSMState.PLAN_AVOIDANCE, now)
                 return (PlannerDecision(state=FSMState.PLAN_AVOIDANCE, action=Action.SLOW,
                                          reason="entering avoidance planning"),
-                        self._throttle_only_command(FSMState.PLAN_AVOIDANCE))
+                        AvoidanceCommand(command_valid=False))
             return (PlannerDecision(state=FSMState.OBJECT_DETECTED, action=Action.SLOW,
                                      reason="object detected, not yet ready to plan avoidance"),
-                    self._throttle_only_command(FSMState.OBJECT_DETECTED))
+                    AvoidanceCommand(command_valid=False))
 
         elif self.state == FSMState.PLAN_AVOIDANCE:
             if det is None:
@@ -466,7 +475,7 @@ class ObstaclePlanner:
                 # _check_emergency on a later tick.
                 return (PlannerDecision(state=FSMState.PLAN_AVOIDANCE, action=Action.SLOW,
                                          reason="no current detection while planning"),
-                        self._throttle_only_command(FSMState.PLAN_AVOIDANCE))
+                        AvoidanceCommand(command_valid=False))
             # corridor==None and "no side safe" are both already routed to
             # EMERGENCY_STOP by _check_emergency before we get here (this
             # only holds because PLAN_AVOIDANCE persists for a full tick
@@ -625,9 +634,6 @@ class ObstaclePlanner:
         if reverse:
             sign = -sign
         return self.avoid_steer_polarity * self.avoid_steer_magnitude * sign
-
-    def _throttle_only_command(self, state: FSMState) -> AvoidanceCommand:
-        return AvoidanceCommand(steering=0.0, throttle=self.throttle_table.get(state, 0.0), command_valid=True)
 
     # ------------------------------------------------------------------
     # Vehicle part entry point
