@@ -1,15 +1,61 @@
-# Donkeycar: a python self driving library
+# Right-Lane Driving & Obstacle Avoidance — UCSD DSC 190 Final Project (Team 7)
 
-> Fork for UCSD's DSC190 class (Team 7)
+## Team Members
+
+- Ryan Tang, HDSI
+- Marcus de Ramos, HDSI
+- Yuxing Liu, School of Physical Sciences
+
+## What We Promised
+
+At the outset we scoped the project into must-haves — the core capabilities required for the project to succeed — and nice-to-haves — stretch goals we'd pursue if time allowed.
+
+**Must haves**
+- Improved line following
+- Full-lane perception
+- Obstacle detection and oncoming car detection (with Team 2)
+
+**Nice to haves**
+- Accepted upstream contribution to Donkeycar
+- Integrating another sensor
+
+## What We Accomplished
+
+Across the two autopilot generations built for this car — `LineFollower` and its successor `LaneFollower` — we made steady, tested improvements over the baseline algorithm, then layered cone detection and avoidance on top.
+
+**LineFollower** — marginal improvements over the baseline:
+- Blob shape-filtering (area/width/aspect) rejects gravel/glare instead of raw max-color-column
+- RGB dominance test catches shadowed paint that HSV alone misses
+
+**LaneFollower** — reliable right- and left-lane driving, both loops, normal lighting:
+- 3 scan rows instead of one
+- Works in both lanes, both directions
+- Open issues remain in bright glare and tight-turn speed; occasionally veers off track in uneven lighting
+
+**Summary**
+- Improvements to line following
+- Right- and left-lane driving
+- Accurate cone recognition and depth estimation
+- Lane-follower works under different light conditions
 
 ## Purpose
 
-This fork extends the base Donkeycar library for a specific car built for
-UCSD's DSC 190 (Team 7): an RC car that drives autonomously in the right
-lane of a two-lane track (between the solid outer edge and the dashed
-yellow center line), detects orange traffic cones with a depth camera,
-and swerves around them before returning to lane-following. It uses
-classical computer vision (HSV color thresholding), not a trained model.
+Goal: use Claude as a coding agent to build new autonomous behaviors for
+this car, through an iterative "assign mission → agent writes code →
+test on the car → give feedback → agent revises" loop.
+
+Mission progression, each stage building on the last:
+- **Line following** — track a single line down the track with classical computer vision (`LineFollower`)
+- **Lane following** — upgrade from tracking a single line to full-lane navigation, staying in the right lane between the solid outer edge and the dashed yellow center line (`LaneFollower`)
+- **Obstacle avoidance** — detect an orange traffic cone (and, longer-term, an oncoming car approaching in the opposite lane, with Team 2) and swerve around it without a collision
+
+Process: for each stage we gave Claude a mission, had it write the
+control/vision code, tested it on the real car, then fed back what
+failed so it could revise its approach. See What We Accomplished above
+for how the agent's code evolved across iterations and what feedback
+drove each improvement. The system uses classical computer vision (HSV
+color thresholding) with a depth camera for cone detection, not a
+trained model.
 
 Key custom parts:
 
@@ -142,3 +188,9 @@ V.start(rate_hz=10)
 
 See [home page](http://donkeycar.com), [docs](http://docs.donkeycar.com)
 or join the [Discord server](http://www.donkeycar.com/community.html) to learn more.
+
+## Contact
+
+- Yuxing Liu — yul269@gmail.com
+- Ryan Tang — r4tang@ucsd.edu
+- Marcus de Ramos — mderamos@ucsd.edu
