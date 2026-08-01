@@ -2,6 +2,66 @@
 
 > Fork for UCSD's DSC190 class (Team 7)
 
+## Purpose
+
+This fork extends the base Donkeycar library for a specific car built for
+UCSD's DSC 190 (Team 7): an RC car that drives autonomously in the right
+lane of a two-lane track (between the solid outer edge and the dashed
+yellow center line), detects orange traffic cones with a depth camera,
+and swerves around them before returning to lane-following. It uses
+classical computer vision (HSV color thresholding), not a trained model.
+
+Key custom parts:
+
+- [`donkeycar/parts/lane_follower.py`](donkeycar/parts/lane_follower.py) — lane-aware line following (right lane between the solid edge and the dashed center line)
+- [`donkeycar/parts/obstacle_planner.py`](donkeycar/parts/obstacle_planner.py) — cone detection and avoidance state machine (classical OpenCV/HSV detection, not ML)
+- [`donkeycar/parts/oak_d.py`](donkeycar/parts/oak_d.py) — OAK-D depth camera integration
+
+See [OBSTACLE_AVOIDANCE.md](OBSTACLE_AVOIDANCE.md) for full architecture, config, and calibration details on the obstacle-avoidance system.
+
+## How to use this repo
+
+1. **Install** on the Raspberry Pi following the standard Donkeycar [install docs](https://docs.donkeycar.com/guide/install_software/), then `pip install depthai` separately (not in `setup.cfg`).
+2. **Create your car project** with `donkey createcar --path ~/mycar --template cv_control` — this copies `cv_control.py` as `manage.py` and generates `config.py`/`myconfig.py`.
+3. **Configure `myconfig.py`** in your car project (not in this repo) with your camera resolution (`IMAGE_W = 426`, `IMAGE_H = 240`), calibrated `ORANGE_HSV_THRESHOLD_LOW/HIGH` (use `scripts/hsv_picker.py` against a real photo of your cone), and `OBSTACLE_AVOIDANCE_MODE` (`disabled` → `observe` → `shadow` → `active`, tested in that order).
+4. **Drive**: `python manage.py drive` from your car project directory, then connect to the web UI to start driving/recording.
+5. **Test obstacle avoidance safely**: start in `observe` mode to confirm cone detection in the web UI overlay, then `shadow` mode to confirm the full decision logic without touching the motors, before enabling `active` mode.
+
+Full config reference and troubleshooting: [OBSTACLE_AVOIDANCE.md](OBSTACLE_AVOIDANCE.md).
+
+### What to add to your car project
+
+`myconfig.py` and `manage.py` live in your car project (e.g. `~/mycar`), not in this repo, so `donkey createcar` won't set these up for you. Add:
+
+**`myconfig.py`**
+```python
+IMAGE_W = 426
+IMAGE_H = 240
+
+CV_CONTROLLER_MODULE = "donkeycar.parts.lane_follower"
+CV_CONTROLLER_CLASS = "LaneFollower"
+
+OBSTACLE_AVOIDANCE_MODE = "disabled"   # disabled | observe | shadow | active
+CONE_DETECTOR_MODE = "opencv"
+ORANGE_HSV_THRESHOLD_LOW = (2, 78, 91)      # calibrate with scripts/hsv_picker.py
+ORANGE_HSV_THRESHOLD_HIGH = (12, 229, 245)
+
+AVOID_STEER_DURATION_S = 1.0
+AVOID_STRAIGHT_DURATION_S = 1.5
+AVOID_RETURN_DURATION_S = 1.0
+AVOID_STEER_MAGNITUDE = 0.5
+AVOID_STEER_POLARITY = 1.0
+
+from donkeycar.parts.obstacle_types import FSMState
+CV_CONTROLLER_OUTPUTS_WITH_ARBITER = ['pilot/steering_raw', 'pilot/throttle_raw', 'cv/image_array',
+                                       'lane/yellow_x', 'lane/white_x', 'lane/width_px', 'lane/lost_frames']
+```
+
+**`manage.py`** (based on `cv_control.py`)
+- `ObstaclePlanner`'s inputs list must include `'pilot/steering_raw'` and `'pilot/throttle_raw'` alongside the existing detector/lane inputs.
+
+See [OBSTACLE_AVOIDANCE.md](OBSTACLE_AVOIDANCE.md) for what each value does and how to tune it.
+
 ![Build Status](https://github.com/autorope/donkeycar/actions/workflows/python-package-conda.yml/badge.svg?branch=main)
 ![Lint Status](https://github.com/autorope/donkeycar/actions/workflows/superlinter.yml/badge.svg?branch=main)
 ![Release](https://img.shields.io/github/v/release/autorope/donkeycar)
